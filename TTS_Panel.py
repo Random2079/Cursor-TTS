@@ -1,0 +1,1348 @@
+"""
+Панель настроек Cursor TTS (PyQt5).
+Управляет теми же файлами, что хук и AHK: TTS_OFF, tts_config.json, pid.
+Запуск: python TTS_Panel.py
+Горячие клавиши AHK остаются как есть.
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDesktopWidget,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QProgressBar,
+    QPushButton,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
+
+ROOT = Path(__file__).resolve().parent
+OFF_FLAG = ROOT / "TTS_OFF"
+PANEL_ACTIVE_FLAG = ROOT / "TTS_PANEL_ACTIVE"
+PAUSE_FLAG = ROOT / "TTS_PAUSED"
+CONFIG_FILE = ROOT / "tts_config.json"
+PID_FILE = ROOT / "tts_speech.pid"
+SPEAK_EDGE = ROOT / "speak_edge.py"  # клиент к демону (имя историческое)
+
+VOICES_LOCAL = [
+    ("xenia", "Ксения (Silero)"),
+    ("baya", "Бая (Silero)"),
+    ("kseniya", "Ксения-2 (Silero)"),
+    ("aidar", "Айдар (Silero)"),
+    ("eugene", "Евгений (Silero)"),
+]
+DEFAULT_LOCAL_SPEAKER = "xenia"
+DEFAULT_HYBRID_MODE = "dict_only"
+DEFAULT_VOLUME = 45
+DEFAULT_ENGINE = "tera"
+DEFAULT_PAUSE_MS = 350
+DEFAULT_QWEN_SPEAKER = "serena"
+DEFAULT_QWEN_DESIGN = "micro_wife/designs/02_soft_high_female.txt"
+DEFAULT_OPENAI_VOICE = "nova"
+DEFAULT_EDGE_VOICE = "ru-RU-SvetlanaNeural"
+DEFAULT_TERA_VOICE = "ru_f1"
+DEFAULT_TERA_DURATION_SCALE = 1.0
+_ENGINES = {"local", "edge", "tera", "qwen", "openai"}
+_DEAD_ENGINES = {"kokoro", "piper"}
+_HYBRID_MODES = {"off", "dict_only"}
+HYBRID_ITEMS = [
+    ("off", "Как написано (без словаря)"),
+    ("dict_only", "Словарь IT (fallback → фэлбэк)"),
+]
+VOICES_QWEN = [
+    ("micro_wife/designs/06_work_male_neutral.txt", "6 · рабочий мужской (ровный)"),
+    ("micro_wife/designs/02_soft_high_female.txt", "2 · мягкий высокий (micro wife)"),
+    ("micro_wife/designs/05_adult_book_female.txt", "5 · взрослая книжная (не лоли)"),
+]
+VOICES_OPENAI = [
+    ("nova", "Nova (жен., яркий)"),
+    ("shimmer", "Shimmer (жен., мягкий)"),
+    ("alloy", "Alloy (нейтральный)"),
+    ("echo", "Echo (муж.)"),
+    ("onyx", "Onyx (муж., низкий)"),
+    ("fable", "Fable (сторителлинг)"),
+]
+VOICES_EDGE = [
+    ("ru-RU-SvetlanaNeural", "Светлана (Edge, жен.)"),
+    ("ru-RU-DariyaNeural", "Дарья (Edge, жен.)"),
+    ("ru-RU-DmitryNeural", "Дмитрий (Edge, муж.)"),
+]
+VOICES_TERA = [
+    ("ru_f1", "Tera · жен. ru_f1"),
+    ("ru_f2", "Tera · жен. ru_f2"),
+    ("ru_m5", "Tera · муж. ru_m5"),
+    ("ru_m1", "Tera · муж. ru_m1"),
+]
+TEST_PHRASE = "Привет. Это проверка голоса Cursor TTS. Tera, Edge или Silero."
+# Tera warm ~2–4с; Edge ~1–2с; Silero cold тяжелее. Дальше stale — зависон.
+WARMUP_STALE_SEC = 240
+
+
+def load_config() -> dict:
+    data = {
+        "engine": DEFAULT_ENGINE,
+        "local_speaker": DEFAULT_LOCAL_SPEAKER,
+        "openai_voice": DEFAULT_OPENAI_VOICE,
+        "edge_voice": DEFAULT_EDGE_VOICE,
+        "tera_voice": DEFAULT_TERA_VOICE,
+        "tera_duration_scale": DEFAULT_TERA_DURATION_SCALE,
+        "hybrid_mode": DEFAULT_HYBRID_MODE,
+        "micro_wife_design_file": DEFAULT_QWEN_DESIGN,
+        "qwen_speaker": DEFAULT_QWEN_SPEAKER,
+        "volume": DEFAULT_VOLUME,
+        "interrupt_on_new": False,
+        "pause_ms": DEFAULT_PAUSE_MS,
+    }
+    if CONFIG_FILE.is_file():
+        try:
+            raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data.update(raw)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    engine = str(data.get("engine", DEFAULT_ENGINE)).strip().lower()
+    if engine == "kokoro":
+        engine = "edge"
+    elif engine == "piper":
+        engine = "local"
+    if engine not in _ENGINES:
+        engine = DEFAULT_ENGINE
+    data["engine"] = engine
+
+    local_speaker = str(data.get("local_speaker", DEFAULT_LOCAL_SPEAKER)).strip().lower()
+    known_local = {code for code, _ in VOICES_LOCAL}
+    if local_speaker not in known_local:
+        local_speaker = DEFAULT_LOCAL_SPEAKER
+    data["local_speaker"] = local_speaker
+
+    openai_voice = str(data.get("openai_voice", DEFAULT_OPENAI_VOICE)).strip().lower()
+    known_openai = {code for code, _ in VOICES_OPENAI}
+    if openai_voice not in known_openai:
+        openai_voice = DEFAULT_OPENAI_VOICE
+    data["openai_voice"] = openai_voice
+
+    edge_voice = str(data.get("edge_voice", DEFAULT_EDGE_VOICE)).strip()
+    known_edge = {code for code, _ in VOICES_EDGE}
+    if edge_voice not in known_edge:
+        edge_voice = DEFAULT_EDGE_VOICE
+    data["edge_voice"] = edge_voice
+
+    tera_voice = str(data.get("tera_voice", DEFAULT_TERA_VOICE)).strip()
+    known_tera = {code for code, _ in VOICES_TERA}
+    if tera_voice not in known_tera:
+        tera_voice = DEFAULT_TERA_VOICE
+    data["tera_voice"] = tera_voice
+    try:
+        scale = float(data.get("tera_duration_scale", DEFAULT_TERA_DURATION_SCALE))
+    except (TypeError, ValueError):
+        scale = DEFAULT_TERA_DURATION_SCALE
+    data["tera_duration_scale"] = max(0.6, min(1.5, scale))
+
+    hybrid = str(data.get("hybrid_mode", DEFAULT_HYBRID_MODE)).strip().lower()
+    if hybrid == "dict_and_en":
+        hybrid = "dict_only"
+    data["hybrid_mode"] = hybrid if hybrid in _HYBRID_MODES else DEFAULT_HYBRID_MODE
+
+    design = str(data.get("micro_wife_design_file", DEFAULT_QWEN_DESIGN)).strip()
+    known_qwen = {code for code, _ in VOICES_QWEN}
+    if design not in known_qwen:
+        design = DEFAULT_QWEN_DESIGN
+    data["micro_wife_design_file"] = design
+    data["qwen_speaker"] = (
+        str(data.get("qwen_speaker", DEFAULT_QWEN_SPEAKER)).strip() or DEFAULT_QWEN_SPEAKER
+    )
+
+    try:
+        volume = int(data.get("volume", DEFAULT_VOLUME))
+    except (TypeError, ValueError):
+        volume = DEFAULT_VOLUME
+    data["volume"] = max(10, min(100, volume))
+    data["interrupt_on_new"] = bool(data.get("interrupt_on_new", False))
+    try:
+        data["pause_ms"] = max(0, min(1500, int(data.get("pause_ms", DEFAULT_PAUSE_MS))))
+    except (TypeError, ValueError):
+        data["pause_ms"] = DEFAULT_PAUSE_MS
+    return data
+
+
+def save_config(
+    *,
+    engine: str | None = None,
+    local_speaker: str | None = None,
+    openai_voice: str | None = None,
+    edge_voice: str | None = None,
+    tera_voice: str | None = None,
+    tera_duration_scale: float | None = None,
+    hybrid_mode: str | None = None,
+    micro_wife_design_file: str | None = None,
+    qwen_speaker: str | None = None,
+    volume: int | None = None,
+    interrupt_on_new: bool | None = None,
+    pause_ms: int | None = None,
+) -> None:
+    data = load_config()
+    if engine is not None:
+        data["engine"] = engine if engine in _ENGINES else DEFAULT_ENGINE
+    if local_speaker is not None:
+        voice = str(local_speaker).strip().lower()
+        known = {code for code, _ in VOICES_LOCAL}
+        data["local_speaker"] = voice if voice in known else DEFAULT_LOCAL_SPEAKER
+    if openai_voice is not None:
+        voice = str(openai_voice).strip().lower()
+        known = {code for code, _ in VOICES_OPENAI}
+        data["openai_voice"] = voice if voice in known else DEFAULT_OPENAI_VOICE
+    if edge_voice is not None:
+        voice = str(edge_voice).strip()
+        known = {code for code, _ in VOICES_EDGE}
+        data["edge_voice"] = voice if voice in known else DEFAULT_EDGE_VOICE
+    if tera_voice is not None:
+        voice = str(tera_voice).strip()
+        known = {code for code, _ in VOICES_TERA}
+        data["tera_voice"] = voice if voice in known else DEFAULT_TERA_VOICE
+    if tera_duration_scale is not None:
+        try:
+            scale = float(tera_duration_scale)
+        except (TypeError, ValueError):
+            scale = DEFAULT_TERA_DURATION_SCALE
+        data["tera_duration_scale"] = max(0.6, min(1.5, scale))
+    if hybrid_mode is not None:
+        mode = str(hybrid_mode).strip().lower()
+        if mode == "dict_and_en":
+            mode = "dict_only"
+        data["hybrid_mode"] = mode if mode in _HYBRID_MODES else DEFAULT_HYBRID_MODE
+    if micro_wife_design_file is not None:
+        data["micro_wife_design_file"] = micro_wife_design_file
+        # держим active voice_design.txt в синхроне с пресетом
+        try:
+            src = ROOT / micro_wife_design_file
+            dst = ROOT / "micro_wife" / "voice_design.txt"
+            if src.is_file():
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        except OSError:
+            pass
+    if qwen_speaker is not None:
+        data["qwen_speaker"] = qwen_speaker
+    if volume is not None:
+        data["volume"] = max(10, min(100, volume))
+    if interrupt_on_new is not None:
+        data["interrupt_on_new"] = interrupt_on_new
+    if pause_ms is not None:
+        data["pause_ms"] = max(0, min(1500, pause_ms))
+    # вычищаем мёртвые ключи старых движков
+    for dead in (
+        "voice",
+        "piper_model",
+        "piper_model_en",
+        "kokoro_voice",
+    ):
+        data.pop(dead, None)
+    data["micro_wife_ready"] = True
+    CONFIG_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def is_auto_on() -> bool:
+    return not OFF_FLAG.exists()
+
+
+def set_auto_on(enabled: bool) -> None:
+    if enabled:
+        OFF_FLAG.unlink(missing_ok=True)
+    else:
+        OFF_FLAG.write_text("", encoding="utf-8")
+
+
+def set_panel_active(active: bool) -> None:
+    """Хук авто-озвучки разрешён только пока панель открыта."""
+    if active:
+        PANEL_ACTIVE_FLAG.write_text(str(os.getpid()), encoding="ascii")
+    else:
+        PANEL_ACTIVE_FLAG.unlink(missing_ok=True)
+
+
+DAEMON_PID_FILE = ROOT / "tts_daemon.pid"
+AHK_SCRIPT = ROOT / "hotkey_tts.ahk"
+
+
+def find_ahk_v1() -> Path | None:
+    candidates = [
+        Path(r"C:\Program Files\AutoHotkey\v1.1.37.02\AutoHotkeyU64.exe"),
+        Path(r"C:\Program Files\AutoHotkey\v1.1.37.02\AutoHotkeyU32.exe"),
+        Path(r"C:\Program Files\AutoHotkey\AutoHotkeyU64.exe"),
+        Path(r"C:\Program Files\AutoHotkey\AutoHotkey.exe"),
+        Path(r"C:\Program Files (x86)\AutoHotkey\AutoHotkey.exe"),
+        Path(r"C:\Program Files\AutoHotkey\UX\AutoHotkeyUX.exe"),
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def ahk_running() -> bool:
+    flags = 0x08000000 if sys.platform == "win32" else 0
+    result = subprocess.run(
+        ["tasklist"],
+        capture_output=True,
+        text=True,
+        creationflags=flags,
+    )
+    out = result.stdout.lower()
+    return "autohotkey" in out
+
+
+def ensure_hotkeys() -> str:
+    """Поднять hotkey_tts.ahk, если AutoHotkey ещё не в процессах."""
+    if not AHK_SCRIPT.is_file():
+        return "missing_script"
+    if ahk_running():
+        return "already_running"
+    ahk = find_ahk_v1()
+    flags = 0x08000000 if sys.platform == "win32" else 0
+    try:
+        if ahk is not None:
+            subprocess.Popen(
+                [str(ahk), str(AHK_SCRIPT)],
+                cwd=str(ROOT),
+                creationflags=flags,
+            )
+            return f"started:{ahk.name}"
+        # Assoc .ahk — UX launcher + #Requires v1.1
+        os.startfile(str(AHK_SCRIPT))  # type: ignore[attr-defined]
+        return "started:assoc"
+    except OSError as exc:
+        return f"fail:{exc}"
+
+
+def stop_speech() -> None:
+    flags = 0x08000000 if sys.platform == "win32" else 0
+    if SPEAK_EDGE.is_file():
+        subprocess.run(
+            [sys.executable, str(SPEAK_EDGE), "--stop"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+
+
+_tts_stack_shutting_down = False
+
+
+def _taskkill_pid(pid: int) -> None:
+    if pid <= 0:
+        return
+    flags = 0x08000000 if sys.platform == "win32" else 0
+    subprocess.run(
+        ["taskkill", "/F", "/T", "/PID", str(pid)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+
+
+def _iter_windows_cmdlines() -> list[tuple[int, str]]:
+    """(pid, CommandLine) для python / AutoHotkey."""
+    if sys.platform != "win32":
+        return []
+    flags = 0x08000000
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.Name -match 'python|autohotkey' } | "
+                "ForEach-Object { '{0}|{1}' -f $_.ProcessId, $_.CommandLine }",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=flags,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    out: list[tuple[int, str]] = []
+    for line in (result.stdout or "").splitlines():
+        if "|" not in line:
+            continue
+        pid_s, cmd = line.split("|", 1)
+        if pid_s.isdigit() and cmd.strip():
+            out.append((int(pid_s), cmd))
+    return out
+
+
+def shutdown_tts_stack() -> None:
+    """Крест панели = выключить весь TTS (демон, kokoro, зависшие warmup, наши хоткеи).
+
+    Раньше closeEvent только снимал TTS_OFF, а pythonw-процессы жили дальше.
+    """
+    global _tts_stack_shutting_down
+    if _tts_stack_shutting_down:
+        return
+    _tts_stack_shutting_down = True
+    set_panel_active(False)
+    try:
+        stop_speech()
+    except Exception:
+        pass
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from speak_edge import stop_daemon
+
+        stop_daemon(force=True)
+    except Exception:
+        try:
+            if DAEMON_PID_FILE.is_file():
+                pid = int(DAEMON_PID_FILE.read_text(encoding="ascii").strip())
+                _taskkill_pid(pid)
+                DAEMON_PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    root_norm = str(ROOT).replace("/", "\\").lower()
+    markers = (
+        "tts_daemon.py",
+        "kokoro_worker.py",
+        "speak_edge.py",
+        "hotkey_tts.ahk",
+        "tts_panel.py",
+    )
+    my_pid = os.getpid()
+    for pid, cmd in _iter_windows_cmdlines():
+        if pid == my_pid:
+            continue
+        low = cmd.replace("/", "\\").lower()
+        if root_norm not in low and "cursor_tts" not in low:
+            continue
+        if not any(m in low for m in markers):
+            continue
+        if "autohotkey" in low and "hotkey_tts.ahk" not in low:
+            continue
+        _taskkill_pid(pid)
+
+    PAUSE_FLAG.unlink(missing_ok=True)
+
+
+def is_paused_flag() -> bool:
+    return PAUSE_FLAG.is_file()
+
+
+def pause_toggle_speech() -> bool:
+    """Toggle pause. Возвращает True если после команды на паузе."""
+    flags = 0x08000000 if sys.platform == "win32" else 0
+    if not SPEAK_EDGE.is_file():
+        return is_paused_flag()
+    try:
+        result = subprocess.run(
+            [sys.executable, str(SPEAK_EDGE), "--pause-toggle"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=flags,
+            timeout=5,
+        )
+        out = (result.stdout or "").strip().upper()
+        if "PAUSED" in out:
+            return True
+        if "PLAYING" in out:
+            return False
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return is_paused_flag()
+
+
+def warmup_tts_backend() -> None:
+    """Прогреть модель при открытии панели.
+
+    Не делаем --restart-daemon каждый раз: для Qwen это сбрасывает VRAM
+    и снова даёт ~10–70 с cold load. Рестарт — только вручную
+    (speak_edge.py --restart-daemon) после правок кода демона.
+    """
+    if not SPEAK_EDGE.is_file():
+        return
+    flags = 0x08000000 if sys.platform == "win32" else 0
+
+    def run() -> None:
+        try:
+            subprocess.run(
+                [sys.executable, str(SPEAK_EDGE), "--warmup"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+                timeout=200,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    threading.Thread(target=run, name="tts-panel-warmup", daemon=True).start()
+
+
+def daemon_busy(status: dict) -> bool:
+    """Есть ли реальная работа у демона (без tasklist)."""
+    if not status:
+        return False
+    phase = str(status.get("phase", "idle")).strip().lower()
+    return (
+        phase in {"preparing", "synthesizing", "playing"}
+        or bool(status.get("warming"))
+        or int(status.get("queue", 0) or 0) > 0
+    )
+
+
+def pause_actionable(status: dict) -> bool:
+    """Пауза имеет смысл только когда что-то играет / в очереди."""
+    return daemon_busy(status)
+
+
+def preview_allowed(status: dict) -> bool:
+    """Прослушать только когда демон не грузит модель и не озвучивает."""
+    if bool(status.get("warming")):
+        return False
+    return not daemon_busy(status)
+
+
+def engine_change_allowed(status: dict) -> bool:
+    """Смена движка = reboot демона — нельзя во время озвучки/прогрева."""
+    return not daemon_busy(status)
+
+
+def warmup_is_stale(status: dict) -> bool:
+    if not status.get("warming"):
+        return False
+    if status.get("warmup_stale"):
+        return True
+    return int(status.get("elapsed_sec", 0) or 0) >= WARMUP_STALE_SEC
+
+
+def daemon_status() -> dict:
+    """Живой прогресс: warmup / synth N/M / play N/M / очередь."""
+    try:
+        raw = (json.dumps({"cmd": "status"}) + "\n").encode("utf-8")
+        with socket.create_connection(("127.0.0.1", 47391), timeout=0.4) as sock:
+            sock.settimeout(0.4)
+            sock.sendall(raw)
+            data = b""
+            while not data.endswith(b"\n"):
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                data += piece
+        if data:
+            result = json.loads(data.decode("utf-8").strip())
+            return result if isinstance(result, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def format_daemon_progress(status: dict) -> str:
+    if not status:
+        return "Прогресс: демон недоступен"
+    engine = str(status.get("engine", "")).upper() or "TTS"
+    queue_size = int(status.get("queue", 0) or 0)
+    current = int(status.get("current", 0) or 0)
+    total = int(status.get("total", 0) or 0)
+    phase = str(status.get("phase", "idle"))
+    elapsed = int(status.get("elapsed_sec", 0) or 0)
+    chunk = f"{current} из {total}" if total else "?"
+
+    if status.get("warming"):
+        if warmup_is_stale(status):
+            text = (
+                f"⚠ {engine}: загрузка зависла · {elapsed} с "
+                f"(лимит {WARMUP_STALE_SEC} с). Закрой панель или временно Edge."
+            )
+        else:
+            text = f"⏳ {engine}: загрузка модели · {elapsed} с"
+            if total:
+                text += f" · затем кусок {current or 1} из {total}"
+    elif status.get("paused") and (
+        str(status.get("phase", "idle")).lower()
+        in {"preparing", "synthesizing", "playing"}
+        or queue_size
+    ):
+        text = f"⏸ {engine}: на паузе"
+        if total:
+            text += f" · кусок {chunk}"
+    elif phase == "preparing":
+        text = f"⏳ {engine}: подготовка текста · {elapsed} с"
+    elif phase == "synthesizing":
+        text = f"🧠 {engine}: синтез {chunk} · ждём звук · {elapsed} с"
+    elif phase == "playing":
+        text = f"▶ {engine}: играет {chunk} · {elapsed} с"
+    else:
+        text = f"✓ {engine}: готов"
+
+    if queue_size:
+        text += f" · в очереди: {queue_size}"
+    return text
+
+
+def progress_bar_state(status: dict) -> tuple[int, int, bool, str]:
+    """value, maximum, indeterminate, window title.
+
+    Без фейковых %: либо бегущая полоска, либо честные куски N/M при play.
+    """
+    if not status:
+        return 0, 100, False, ""
+    phase = str(status.get("phase", "idle"))
+    current = int(status.get("current", 0) or 0)
+    total = int(status.get("total", 0) or 0)
+    elapsed = int(status.get("elapsed_sec", 0) or 0)
+    if status.get("warming"):
+        if warmup_is_stale(status):
+            return 0, 0, True, f"зависла {elapsed}с"
+        return 0, 0, True, f"загрузка… {elapsed}с"
+    if status.get("paused") and (
+        phase in {"preparing", "synthesizing", "playing"}
+        or int(status.get("queue", 0) or 0) > 0
+    ):
+        suffix = f"пауза {current}/{total}" if total else "пауза"
+        return 0, 0, True, suffix
+    if phase == "preparing":
+        return 0, 0, True, "подготовка…"
+    if phase == "synthesizing":
+        return 0, 0, True, f"синтез {current}/{total} · {elapsed}с" if total else f"синтез… {elapsed}с"
+    if phase == "playing":
+        if total > 1:
+            return current, total, False, f"играет {current}/{total}"
+        return 0, 0, True, f"играет · {elapsed}с"
+    return 0, 100, False, ""
+
+
+class TTSPanel(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Cursor TTS")
+        self.resize(460, 400)
+        self.setMinimumWidth(440)
+        self._center()
+        self._updating = False
+        self._poll_busy = False
+        self._preview_hold = False
+        self._stale_killed = False
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        self.auto_checkbox = QCheckBox("Авто-озвучка ответов Agent", self)
+        self.auto_checkbox.toggled.connect(self._on_auto_toggled)
+        layout.addWidget(self.auto_checkbox)
+
+        self.interrupt_checkbox = QCheckBox(
+            "Обрывать старую озвучку новым ответом",
+            self,
+        )
+        self.interrupt_checkbox.setToolTip(
+            "Выкл = очередь (быстрее). Вкл = Stop mid-synth, возможен cold load."
+        )
+        self.interrupt_checkbox.toggled.connect(self._on_interrupt_toggled)
+        layout.addWidget(self.interrupt_checkbox)
+
+        engine_row = QHBoxLayout()
+        engine_row.addWidget(QLabel("Движок:", self))
+        self.engine_combo = QComboBox(self)
+        self.engine_combo.addItem("TeraTTS (локальный, качество)", "tera")
+        self.engine_combo.addItem("Edge TTS (Microsoft, онлайн)", "edge")
+        self.engine_combo.addItem("Silero (быстрый, офлайн)", "local")
+        self.engine_combo.addItem("Micro wife (Qwen)", "qwen")
+        self.engine_combo.addItem("OpenAI API (нужен VPN из РФ)", "openai")
+        self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+        engine_row.addWidget(self.engine_combo, stretch=1)
+        layout.addLayout(engine_row)
+
+        voice_row = QHBoxLayout()
+        voice_row.addWidget(QLabel("Голос:", self))
+        self.voice_combo = QComboBox(self)
+        self.voice_combo.currentIndexChanged.connect(self._on_voice_changed)
+        voice_row.addWidget(self.voice_combo, stretch=1)
+        layout.addLayout(voice_row)
+
+        hybrid_row = QHBoxLayout()
+        hybrid_row.addWidget(QLabel("Текст:", self))
+        self.hybrid_combo = QComboBox(self)
+        for code, label in HYBRID_ITEMS:
+            self.hybrid_combo.addItem(label, code)
+        self.hybrid_combo.currentIndexChanged.connect(self._on_hybrid_changed)
+        hybrid_row.addWidget(self.hybrid_combo, stretch=1)
+        layout.addLayout(hybrid_row)
+
+        volume_row = QHBoxLayout()
+        volume_row.addWidget(QLabel("Громкость:", self))
+        self.volume_slider = QSlider(Qt.Horizontal, self)
+        self.volume_slider.setRange(10, 100)
+        self.volume_slider.setTickInterval(10)
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        volume_row.addWidget(self.volume_slider, stretch=1)
+        self.volume_label = QLabel("", self)
+        self.volume_label.setMinimumWidth(42)
+        volume_row.addWidget(self.volume_label)
+        layout.addLayout(volume_row)
+
+        pause_row = QHBoxLayout()
+        pause_row.addWidget(QLabel("Пауза:", self))
+        self.pause_slider = QSlider(Qt.Horizontal, self)
+        self.pause_slider.setRange(0, 1000)
+        self.pause_slider.setSingleStep(50)
+        self.pause_slider.setTickInterval(100)
+        self.pause_slider.valueChanged.connect(self._on_pause_changed)
+        pause_row.addWidget(self.pause_slider, stretch=1)
+        self.pause_label = QLabel("", self)
+        self.pause_label.setMinimumWidth(56)
+        pause_row.addWidget(self.pause_label)
+        layout.addLayout(pause_row)
+
+        tempo_row = QHBoxLayout()
+        tempo_row.addWidget(QLabel("Tera темп:", self))
+        self.tera_tempo_slider = QSlider(Qt.Horizontal, self)
+        # 60..150 → duration_scale 0.60..1.50; больше = медленнее
+        self.tera_tempo_slider.setRange(60, 150)
+        self.tera_tempo_slider.setSingleStep(5)
+        self.tera_tempo_slider.setTickInterval(10)
+        self.tera_tempo_slider.setToolTip(
+            "duration_scale Tera: меньше = быстрее речь, больше = медленнее. 100 = норма."
+        )
+        self.tera_tempo_slider.valueChanged.connect(self._on_tera_tempo_changed)
+        tempo_row.addWidget(self.tera_tempo_slider, stretch=1)
+        self.tera_tempo_label = QLabel("", self)
+        self.tera_tempo_label.setMinimumWidth(72)
+        tempo_row.addWidget(self.tera_tempo_label)
+        layout.addLayout(tempo_row)
+
+        buttons = QHBoxLayout()
+        self.test_button = QPushButton("Прослушать", self)
+        self.test_button.clicked.connect(self._on_test)
+        self.test_button.setToolTip("Проверка голоса. Во время загрузки модели кнопка выключена.")
+        self.pause_button = QPushButton("⏸ Пауза", self)
+        self.pause_button.setToolTip(
+            "Заморозить звук на месте. Работает только во время озвучки. "
+            "Ctrl+Shift+P · Стоп сбрасывает всё."
+        )
+        self.pause_button.clicked.connect(self._on_pause_toggle)
+        self.stop_button = QPushButton("Стоп", self)
+        self.stop_button.clicked.connect(self._on_stop)
+        buttons.addWidget(self.test_button)
+        buttons.addWidget(self.pause_button)
+        buttons.addWidget(self.stop_button)
+        layout.addLayout(buttons)
+
+        self.status_label = QLabel("", self)
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.progress_label = QLabel("Прогресс: ожидание демона…", self)
+        self.progress_label.setWordWrap(True)
+        self.progress_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        layout.addWidget(self.progress_label)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%v / %m")
+        self.progress_bar.setMinimumHeight(22)
+        layout.addWidget(self.progress_bar)
+
+        layout.addWidget(
+            QLabel(
+                "Хоткеи: Ctrl+Shift+T авто · P пауза · X стоп · S выделение",
+                self,
+            )
+        )
+
+        # OFF через TTS_OFF не должен переживать рестарт панели (дефолт = авто ON).
+        if OFF_FLAG.exists():
+            set_auto_on(True)
+
+        set_panel_active(True)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._poll_disk)
+        self.timer.start(1000)
+
+        self._reload_from_disk()
+        self._refresh_status()
+        ensure_hotkeys()
+
+    def _center(self) -> None:
+        frame = self.frameGeometry()
+        center = QDesktopWidget().availableGeometry().center()
+        frame.moveCenter(center)
+        self.move(frame.topLeft())
+
+    def _fill_voices(self, engine: str, selected: str | None = None) -> None:
+        self.voice_combo.blockSignals(True)
+        self.voice_combo.clear()
+        if engine == "qwen":
+            items = VOICES_QWEN
+        elif engine == "local":
+            items = VOICES_LOCAL
+        elif engine == "edge":
+            items = VOICES_EDGE
+        elif engine == "tera":
+            items = VOICES_TERA
+        elif engine == "openai":
+            items = VOICES_OPENAI
+        else:
+            items = VOICES_TERA
+        for code, label in items:
+            self.voice_combo.addItem(label, code)
+        if selected:
+            index = self.voice_combo.findData(selected)
+            if index >= 0:
+                self.voice_combo.setCurrentIndex(index)
+        self.voice_combo.blockSignals(False)
+
+    @staticmethod
+    def _selected_voice_for_engine(cfg: dict, engine: str) -> str:
+        if engine == "qwen":
+            return str(cfg.get("micro_wife_design_file", DEFAULT_QWEN_DESIGN))
+        if engine == "local":
+            return str(cfg.get("local_speaker", DEFAULT_LOCAL_SPEAKER))
+        if engine == "edge":
+            return str(cfg.get("edge_voice", DEFAULT_EDGE_VOICE))
+        if engine == "tera":
+            return str(cfg.get("tera_voice", DEFAULT_TERA_VOICE))
+        if engine == "openai":
+            return str(cfg.get("openai_voice", DEFAULT_OPENAI_VOICE))
+        return str(cfg.get("tera_voice", DEFAULT_TERA_VOICE))
+
+    def _reload_from_disk(self) -> None:
+        self._updating = True
+        cfg = load_config()
+        self.auto_checkbox.setChecked(is_auto_on())
+        self.interrupt_checkbox.setChecked(bool(cfg.get("interrupt_on_new", False)))
+        engine_index = self.engine_combo.findData(cfg["engine"])
+        if engine_index >= 0:
+            self.engine_combo.setCurrentIndex(engine_index)
+        selected = self._selected_voice_for_engine(cfg, cfg["engine"])
+        self._fill_voices(cfg["engine"], selected)
+        self.volume_slider.setValue(cfg["volume"])
+        self.volume_label.setText(f"{cfg['volume']}%")
+        self.pause_slider.setValue(int(cfg.get("pause_ms", DEFAULT_PAUSE_MS)))
+        self.pause_label.setText(f"{int(cfg.get('pause_ms', DEFAULT_PAUSE_MS))} ms")
+        scale = float(cfg.get("tera_duration_scale", DEFAULT_TERA_DURATION_SCALE))
+        tempo_pct = int(round(scale * 100))
+        self.tera_tempo_slider.setValue(max(60, min(150, tempo_pct)))
+        self._set_tera_tempo_label(tempo_pct)
+        self.tera_tempo_slider.setEnabled(cfg.get("engine") == "tera")
+        hybrid_index = self.hybrid_combo.findData(
+            cfg.get("hybrid_mode", DEFAULT_HYBRID_MODE)
+        )
+        if hybrid_index >= 0:
+            self.hybrid_combo.setCurrentIndex(hybrid_index)
+        self._updating = False
+
+    def _poll_disk(self) -> None:
+        # AHK мог включить/выключить авто — подтягиваем галочку.
+        want = is_auto_on()
+        if self.auto_checkbox.isChecked() != want:
+            self._updating = True
+            self.auto_checkbox.setChecked(want)
+            self._updating = False
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        auto = "ON" if is_auto_on() else "OFF"
+        engine = self.engine_combo.currentText()
+        voice_label = self.voice_combo.currentText()
+        volume = self.volume_slider.value()
+        status = daemon_status()
+        selected = str(self.engine_combo.currentData() or "").strip().lower()
+        status_engine = str(status.get("engine", "")).strip().lower()
+        if status and selected and status_engine and selected != status_engine:
+            # Смена в комбо уже случилась, демон ещё на старом warmup — не тащим старые секунды.
+            status = dict(status)
+            status["engine"] = selected
+            if status.get("warming"):
+                status["elapsed_sec"] = 0
+        paused = is_paused_flag()
+        if paused and not pause_actionable(status):
+            self._clear_stale_pause()
+            paused = False
+        busy = daemon_busy(status)
+        work = "занят" if busy else "готов"
+        pause_txt = " · пауза" if paused and pause_actionable(status) else ""
+        self.status_label.setText(
+            f"Авто: {auto} · {engine} · {voice_label} · "
+            f"{volume}% · демон {work}{pause_txt}"
+        )
+        self.progress_label.setText(format_daemon_progress(status))
+        value, maximum, indeterminate, title_suffix = progress_bar_state(status)
+        if indeterminate:
+            if self.progress_bar.maximum() != 0:
+                self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("…")
+        else:
+            if self.progress_bar.maximum() != maximum or self.progress_bar.minimum() != 0:
+                self.progress_bar.setRange(0, max(1, maximum))
+            if maximum <= 1:
+                self.progress_bar.setFormat("")
+            else:
+                self.progress_bar.setFormat("%v / %m кусков")
+            if self.progress_bar.value() != value:
+                self.progress_bar.setValue(value)
+        want_title = f"Cursor TTS — {title_suffix}" if title_suffix else "Cursor TTS"
+        if self.windowTitle() != want_title:
+            self.setWindowTitle(want_title)
+        # Busy → чаще (секунды на полоске), idle → реже (без лишнего TCP).
+        if busy != self._poll_busy:
+            self._poll_busy = busy
+            self.timer.setInterval(400 if busy else 1000)
+        self._apply_preview_enabled(status)
+        self._apply_engine_combo_enabled(status)
+        self._apply_pause_ui(paused, status)
+        if warmup_is_stale(status):
+            if not self._stale_killed:
+                self._stale_killed = True
+                threading.Thread(
+                    target=self._kill_stuck_daemon, name="tts-stale-kill", daemon=True
+                ).start()
+        elif not status.get("warming"):
+            self._stale_killed = False
+
+    def _kill_stuck_daemon(self) -> None:
+        try:
+            if str(ROOT) not in sys.path:
+                sys.path.insert(0, str(ROOT))
+            from speak_edge import stop_daemon
+
+            stop_daemon(force=True)
+        except Exception:
+            pass
+
+    def _arm_preview_hold(self) -> None:
+        """Сразу после смены движка warmup ещё не в status — не даём кликнуть Прослушать."""
+        self._preview_hold = True
+        self.test_button.setEnabled(False)
+        self.test_button.setToolTip("Модель грузится — Прослушать выключено.")
+        QTimer.singleShot(2500, self._release_preview_hold_if_idle)
+
+    def _release_preview_hold_if_idle(self) -> None:
+        self._preview_hold = False
+        self._refresh_status()
+
+    def _apply_preview_enabled(self, status: dict) -> None:
+        allowed = preview_allowed(status) and not self._preview_hold
+        if self.test_button.isEnabled() != allowed:
+            self.test_button.setEnabled(allowed)
+        if allowed:
+            self.test_button.setToolTip("Проверка голоса текущим движком.")
+        elif status.get("warming") or self._preview_hold:
+            self.test_button.setToolTip(
+                "Модель ещё грузится — Прослушать выключено, иначе фраза зависает и Стоп молчит."
+            )
+        elif daemon_busy(status):
+            self.test_button.setToolTip(
+                "Идёт озвучка — дождись конца или нажми Стоп, потом «Прослушать»."
+            )
+        else:
+            self.test_button.setToolTip("Прослушать временно недоступно.")
+
+    def _apply_engine_combo_enabled(self, status: dict) -> None:
+        allowed = engine_change_allowed(status)
+        if self.engine_combo.isEnabled() != allowed:
+            self.engine_combo.setEnabled(allowed)
+        if allowed:
+            self.engine_combo.setToolTip("Движок TTS. Смена перезапускает демон под новую модель.")
+        elif status.get("warming"):
+            self.engine_combo.setToolTip(
+                "Модель грузится — дождись «готов», потом меняй движок."
+            )
+        else:
+            self.engine_combo.setToolTip(
+                "Идёт озвучка — дождись конца или Стоп, потом меняй движок."
+            )
+
+    def _apply_pause_ui(self, paused: bool, status: dict | None = None) -> None:
+        status = status or {}
+        actionable = pause_actionable(status)
+        active = paused and actionable
+        self.pause_button.setEnabled(actionable or active)
+        if active:
+            self.pause_button.setText("▶ Продолжить")
+            self.pause_button.setStyleSheet(
+                "background-color: #c0392b; color: white; font-weight: bold;"
+            )
+        else:
+            self.pause_button.setText("⏸ Пауза")
+            self.pause_button.setStyleSheet("")
+            if not actionable:
+                self.pause_button.setToolTip(
+                    "Появится во время озвучки. Ctrl+Shift+P · Стоп сбрасывает всё."
+                )
+            else:
+                self.pause_button.setToolTip(
+                    "Заморозить звук на месте. Ctrl+Shift+P · Стоп сбрасывает всё."
+                )
+
+    def _clear_stale_pause(self) -> None:
+        """Файл TTS_PAUSED без живой озвучки — снять, иначе UI «висит» на паузе."""
+        PAUSE_FLAG.unlink(missing_ok=True)
+        if SPEAK_EDGE.is_file():
+            flags = 0x08000000 if sys.platform == "win32" else 0
+            try:
+                subprocess.run(
+                    [sys.executable, str(SPEAK_EDGE), "--resume"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=flags,
+                    timeout=3,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    def _on_auto_toggled(self, checked: bool) -> None:
+        if self._updating:
+            return
+        set_auto_on(checked)
+        if not checked:
+            # Только снять текущую речь/очередь. Нельзя ронять демон на warmup Tera —
+            # иначе после «Авто OFF» модель «не запускается» до рестарта панели.
+            stop_speech()
+            self.status_label.setText(
+                "Авто выкл. Демон и прогрев модели продолжают жить — "
+                "Прослушать / выделение работают."
+            )
+        self._refresh_status()
+
+    def _on_interrupt_toggled(self, checked: bool) -> None:
+        if self._updating:
+            return
+        save_config(interrupt_on_new=checked)
+        self.status_label.setText(
+            "Режим: новый ответ обрывает старый."
+            if checked
+            else "Режим: очередь — дочитывает, потом следующий."
+        )
+        self._refresh_status()
+
+    def _on_engine_changed(self, _index: int) -> None:
+        if self._updating:
+            return
+        engine = str(self.engine_combo.currentData() or DEFAULT_ENGINE)
+        status = daemon_status()
+        if not engine_change_allowed(status):
+            prev = str(load_config().get("engine", DEFAULT_ENGINE))
+            self._updating = True
+            prev_index = self.engine_combo.findData(prev)
+            if prev_index >= 0:
+                self.engine_combo.setCurrentIndex(prev_index)
+            self._updating = False
+            if status.get("warming"):
+                self.status_label.setText(
+                    "Модель ещё грузится — смена движка сбросит прогрев. Дождись «готов»."
+                )
+            else:
+                self.status_label.setText(
+                    "Идёт озвучка — смена движка оборвёт текст и перезапустит демон. "
+                    "Дождись конца или нажми Стоп."
+                )
+            return
+        cfg = load_config()
+        selected = self._selected_voice_for_engine(cfg, engine)
+        self._fill_voices(engine, selected)
+        save_config(engine=engine)
+        self._arm_preview_hold()
+        self._stale_killed = False
+        msg_prefix = "Сменил движок — перезапускаю демон. "
+        if engine == "qwen":
+            msg = (
+                f"{msg_prefix}Движок: Micro wife (Qwen). Качество, медленнее. "
+                "CUDA Graphs на старте."
+            )
+        elif engine == "local":
+            msg = (
+                f"{msg_prefix}Движок: Silero (local). Быстрый офлайн. "
+                "Первый старт — скачает модель, дальше тепло."
+            )
+        elif engine == "edge":
+            msg = (
+                f"{msg_prefix}Движок: Edge TTS (Microsoft). Без ключа, нужен интернет. "
+                "Из РФ обычно работает (в отличие от OpenAI)."
+            )
+        elif engine == "tera":
+            msg = (
+                f"{msg_prefix}Движок: TeraTTS. Первый прогрев часто 30–90 с — "
+                "не жми Стоп/Прослушать, дождись «готов». Потом куски ~2–4 с."
+            )
+        elif engine == "openai":
+            msg = (
+                f"{msg_prefix}Движок: OpenAI API. Нужен ключ + VPN из РФ "
+                "(иначе 403). Лучше бери Edge/Tera."
+            )
+        else:
+            msg = f"{msg_prefix}Движок: {engine}."
+        self.status_label.setText(msg)
+        self.tera_tempo_slider.setEnabled(engine == "tera")
+        try:
+            if str(ROOT) not in sys.path:
+                sys.path.insert(0, str(ROOT))
+            from speak_edge import reboot_daemon
+
+            reboot_daemon()
+        except Exception as error:
+            self.status_label.setText(f"Не смог перезапустить демон: {error}")
+        warmup_tts_backend()
+        self._refresh_status()
+
+    def _on_hybrid_changed(self, _index: int) -> None:
+        if self._updating:
+            return
+        mode = str(self.hybrid_combo.currentData() or DEFAULT_HYBRID_MODE)
+        save_config(hybrid_mode=mode)
+        if mode == "off":
+            msg = "Текст: как написано, без словаря."
+        else:
+            msg = "Текст: словарь IT (fallback → фэлбэк). Пауза продолжает тот же слог."
+        self.status_label.setText(msg)
+        self._refresh_status()
+
+    def _on_voice_changed(self, _index: int) -> None:
+        if self._updating:
+            return
+        code = self.voice_combo.currentData()
+        if not code:
+            return
+        engine = str(self.engine_combo.currentData() or DEFAULT_ENGINE)
+        if engine == "qwen":
+            # speaker под пресет (не всегда serena — иначе «баритон» звучит женским)
+            try:
+                import sys as _sys
+
+                micro = str(ROOT / "micro_wife")
+                if micro not in _sys.path:
+                    _sys.path.insert(0, micro)
+                from speak_qwen import speaker_for_design
+
+                spk = speaker_for_design(str(code))
+            except Exception:
+                spk = DEFAULT_QWEN_SPEAKER
+            save_config(micro_wife_design_file=str(code), qwen_speaker=spk)
+        elif engine == "local":
+            save_config(local_speaker=str(code))
+        elif engine == "edge":
+            save_config(edge_voice=str(code))
+        elif engine == "tera":
+            save_config(tera_voice=str(code))
+        elif engine == "openai":
+            save_config(openai_voice=str(code))
+        self._refresh_status()
+
+    def _set_tera_tempo_label(self, tempo_pct: int) -> None:
+        scale = tempo_pct / 100.0
+        if tempo_pct < 95:
+            hint = "быстрее"
+        elif tempo_pct > 105:
+            hint = "медленнее"
+        else:
+            hint = "норма"
+        self.tera_tempo_label.setText(f"{scale:.2f} · {hint}")
+
+    def _on_tera_tempo_changed(self, value: int) -> None:
+        value = int(round(value / 5) * 5)
+        if self.tera_tempo_slider.value() != value:
+            self.tera_tempo_slider.blockSignals(True)
+            self.tera_tempo_slider.setValue(value)
+            self.tera_tempo_slider.blockSignals(False)
+        self._set_tera_tempo_label(value)
+        if self._updating:
+            return
+        save_config(tera_duration_scale=value / 100.0)
+        self._refresh_status()
+
+    def _on_volume_changed(self, value: int) -> None:
+        self.volume_label.setText(f"{value}%")
+        if self._updating:
+            return
+        save_config(volume=value)
+        self._refresh_status()
+
+    def _on_pause_changed(self, value: int) -> None:
+        # snap to 50ms
+        value = int(round(value / 50) * 50)
+        if self.pause_slider.value() != value:
+            self.pause_slider.blockSignals(True)
+            self.pause_slider.setValue(value)
+            self.pause_slider.blockSignals(False)
+        self.pause_label.setText(f"{value} ms")
+        if self._updating:
+            return
+        save_config(pause_ms=value)
+        self._refresh_status()
+
+    def _on_test(self) -> None:
+        status = daemon_status()
+        if status.get("warming") or self._preview_hold:
+            eng = str(status.get("engine") or load_config().get("engine") or "")
+            elapsed = int(status.get("elapsed_sec", 0) or 0)
+            self.status_label.setText(
+                f"Tera/модель ещё грузится ({elapsed} с). Не жми Стоп и Прослушать — "
+                "иначе срывается прогрев и ждёшь 1+ мин снова. Дождись «готов»."
+                if eng == "tera" or load_config().get("engine") == "tera"
+                else "Подожди загрузку модели. Прослушать сейчас не жми."
+            )
+            self.test_button.setEnabled(False)
+            return
+        if daemon_busy(status):
+            self.status_label.setText(
+                "Идёт озвучка ответа — «Прослушать» оборвёт её. "
+                "Дождись конца или нажми Стоп."
+            )
+            return
+        if not preview_allowed(status):
+            self.status_label.setText(
+                "Подожди загрузку модели. Прослушать сейчас не жми — Стоп потом не спасёт."
+            )
+            self.test_button.setEnabled(False)
+            return
+        if not SPEAK_EDGE.is_file():
+            self.status_label.setText("Ошибка: не найден speak_edge.py")
+            return
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".txt", delete=False
+        ) as tmp:
+            tmp.write(TEST_PHRASE)
+            tmp_path = tmp.name
+
+        flags = 0x08000000 if sys.platform == "win32" else 0
+        subprocess.Popen(
+            [sys.executable, str(SPEAK_EDGE), tmp_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        engine = load_config()["engine"]
+        if engine == "tera":
+            tip = (
+                "Tera синтезирует… после прогрева обычно 2–4 с. "
+                "Темп — слайдер «Tera темп» (больше = медленнее)."
+            )
+        elif engine == "edge":
+            tip = "Edge TTS синтезирует… обычно 1–3 с на кусок (нужен интернет)."
+        elif engine == "openai":
+            tip = "OpenAI синтезирует… обычно 1–3 с (ключ + VPN из РФ)."
+        elif engine == "qwen":
+            tip = (
+                "Qwen синтезирует… после прогрева обычно 5–15 секунд. "
+                "Не запускай новую фразу до начала речи."
+            )
+        elif engine == "local":
+            tip = "Silero синтезирует…"
+        else:
+            tip = "Синтез…"
+        self.status_label.setText(tip)
+
+    def _on_pause_toggle(self) -> None:
+        status = daemon_status()
+        if not pause_actionable(status) and not is_paused_flag():
+            self.status_label.setText("Пауза доступна только во время озвучки.")
+            self._apply_pause_ui(False, status)
+            return
+        paused = pause_toggle_speech()
+        status = daemon_status()
+        self._apply_pause_ui(paused, status)
+        if paused:
+            self.status_label.setText("⏸ На паузе — жми «Продолжить» или Ctrl+Shift+P.")
+        else:
+            self.status_label.setText("▶ Продолжаю озвучку.")
+
+    def _on_stop(self) -> None:
+        stop_speech()
+        # стоп снимает паузу в демоне
+        self._apply_pause_ui(False, daemon_status())
+        self.status_label.setText("Остановлено (очередь сброшена, пауза снята).")
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        shutdown_tts_stack()
+        super().closeEvent(event)
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("Cursor TTS")
+
+    from PyQt5.QtCore import QSharedMemory
+    from PyQt5.QtWidgets import QMessageBox
+
+    guard = QSharedMemory("CursorTTS_Panel_SingleInstance")
+    if guard.attach():
+        QMessageBox.information(
+            None,
+            "Cursor TTS",
+            "Панель уже открыта.\nНайди окно «Cursor TTS» на панели задач.",
+        )
+        return 0
+    if not guard.create(1):
+        guard.detach()
+        if not guard.create(1):
+            QMessageBox.warning(
+                None,
+                "Cursor TTS",
+                "Не удалось запустить панель.\n"
+                "Закрой pythonw в диспетчере задач и попробуй снова.",
+            )
+            return 1
+    # Держим SharedMemory живым до выхода (иначе GC → «уже открыта» ломается).
+    app._tts_single_instance = guard  # type: ignore[attr-defined]
+    app.aboutToQuit.connect(shutdown_tts_stack)
+
+    window = TTSPanel()
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    # Холодный старт Kokoro/Qwen — в фоне
+    QTimer.singleShot(300, warmup_tts_backend)
+    return app.exec_()
+
+
+def _show_fatal_error(message: str) -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(0, message, "Cursor TTS", 0x10)
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        log_path = Path(tempfile.gettempdir()) / "cursor_tts_panel.log"
+        log_path.write_text(
+            f"{type(error).__name__}: {error}\n",
+            encoding="utf-8",
+        )
+        _show_fatal_error(
+            f"Ошибка запуска:\n{error}\n\nЛог: {log_path}"
+        )
+        raise SystemExit(1)

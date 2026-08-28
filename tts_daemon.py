@@ -1,0 +1,1453 @@
+"""
+Фоновый TTS-воркер: держит Python/pygame тёплыми, слушает 127.0.0.1:47391.
+Команды (одна JSON-строка):
+  {"cmd":"speak","text":"..."}
+  {"cmd":"stop"}
+  {"cmd":"pause"}
+  {"cmd":"resume"}
+  {"cmd":"pause_toggle"}
+  {"cmd":"ping"}
+  {"cmd":"warmup"}
+"""
+from __future__ import annotations
+
+import json
+import os
+import queue
+import socket
+import sys
+import tempfile
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+ROOT = Path(__file__).resolve().parent
+CONFIG_FILE = ROOT / "tts_config.json"
+PID_FILE = ROOT / "tts_daemon.pid"
+HOST = "127.0.0.1"
+PORT = 47391
+DEFAULT_VOLUME = 45
+DEFAULT_ENGINE = "tera"  # tera | edge | local (Silero) | qwen | openai
+DEFAULT_PAUSE_MS = 350  # пауза между кусками (реф: ~300–500ms между предложениями)
+DEFAULT_HYBRID_MODE = "dict_only"
+DEFAULT_LANG_SWITCH_PAUSE_MS = 80
+DEFAULT_LOCAL_SPEAKER = "xenia"
+DEFAULT_OPENAI_VOICE = "nova"
+DEFAULT_EDGE_VOICE = "ru-RU-SvetlanaNeural"
+DEFAULT_TERA_VOICE = "ru_f1"
+DEFAULT_TERA_DURATION_SCALE = 1.0
+DEFAULT_QWEN_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+DEFAULT_QWEN_SPEAKER = "serena"
+DEFAULT_QWEN_DESIGN = "micro_wife/voice_design.txt"
+_ENGINES = {"local", "edge", "tera", "qwen", "openai"}
+_DEAD_ENGINES = {"kokoro", "piper"}  # kokoro→edge, piper→local
+_HYBRID_MODES = {"off", "dict_only"}
+# Живой Qwen на 3050: 20–30с / до ~160с если тесно. Дальше CUDA стоит — процесс надо убить.
+WARMUP_STALE_SEC = 240
+WARMUP_BUSY_OTHER = -1
+# Stop во время warmup: process exit только для CUDA (Qwen). Остальным — soft cancel.
+_FORCE_EXIT_ON_WARMUP_STOP = {"qwen"}
+
+try:
+    from tts_debug import (
+        debug_log,
+        log_chunk_fail,
+        log_chunk_ok,
+        log_interrupted,
+        log_speak_done,
+        log_speak_start,
+    )
+except ImportError:
+    def debug_log(message: str) -> None:
+        return None
+
+    def log_speak_start(chars: int, parts: int) -> None:
+        return None
+
+    def log_chunk_ok(index: int, total: int, part: str) -> None:
+        return None
+
+    def log_chunk_fail(index: int, total: int, part: str, error: BaseException) -> None:
+        return None
+
+    def log_speak_done(ok_parts: int, fail_parts: int, total_parts: int = 0) -> None:
+        return None
+
+    def log_interrupted(reason: str = "new speak") -> None:
+        return None
+
+_stop_event = threading.Event()
+_paused = False  # pause/resume: не чистит очередь, ждёт resume
+_pause_lock = threading.Lock()
+_speak_lock = threading.Lock()
+_mixer_ready = False
+SOURCE_AFTER_AGENT = "afterAgentResponse"
+SOURCE_STOP = "stop"
+SOURCE_MANUAL = "manual_selection"
+SOURCE_PREVIEW = "preview"
+AUTO_SOURCES = {SOURCE_AFTER_AGENT, SOURCE_STOP}
+
+
+@dataclass(frozen=True)
+class SpeechItem:
+    text: str
+    source: str = SOURCE_MANUAL
+    conversation_id: str = ""
+    generation_id: str = ""
+    priority: int = 100
+
+
+_speech_queue: queue.PriorityQueue[tuple[int, int, SpeechItem | None]] = queue.PriorityQueue()
+_queue_seq = 0
+_queue_seq_lock = threading.Lock()
+_recent_auto_ids: deque[tuple[str, str]] = deque(maxlen=128)
+_recent_auto_ids_set: set[tuple[str, str]] = set()
+_recent_auto_lock = threading.Lock()
+_worker_started = False
+_worker_lock = threading.Lock()
+_progress_lock = threading.Lock()
+_progress: dict[str, object] = {
+    "phase": "idle",
+    "engine": DEFAULT_ENGINE,
+    "current": 0,
+    "total": 0,
+    "source": "",
+    "conversation_id": "",
+    "generation_id": "",
+    "phase_started": time.monotonic(),
+    "paused_accum": 0.0,
+    "pause_mark": 0.0,
+}
+_warmup_active = False
+_warmup_started = 0.0
+_warmup_token = 0
+_warmup_engine = ""
+_warmup_gate = threading.Lock()
+
+
+
+def set_progress(
+    phase: str,
+    *,
+    engine: str | None = None,
+    current: int | None = None,
+    total: int | None = None,
+    source: str | None = None,
+    conversation_id: str | None = None,
+    generation_id: str | None = None,
+) -> None:
+    with _progress_lock:
+        old_phase = str(_progress.get("phase", "idle"))
+        old_current = int(_progress.get("current", 0) or 0)
+        _progress["phase"] = phase
+        if engine is not None:
+            _progress["engine"] = engine
+        if current is not None:
+            _progress["current"] = current
+        if total is not None:
+            _progress["total"] = total
+        if source is not None:
+            _progress["source"] = source
+        if conversation_id is not None:
+            _progress["conversation_id"] = conversation_id
+        if generation_id is not None:
+            _progress["generation_id"] = generation_id
+        if phase != old_phase or (
+            current is not None and int(current) != old_current
+        ):
+            _progress["phase_started"] = time.monotonic()
+            _progress["paused_accum"] = 0.0
+            _progress["pause_mark"] = 0.0
+    if phase == "idle":
+        # Иначе pause_mark сброшен, а _paused=True → elapsed тикает в UI на пустом месте.
+        set_paused(False)
+
+
+def set_warmup_active(value: bool, *, engine: str | None = None) -> int:
+    """Вкл: всегда новый отсчёт (смена движка / повторный warmup). Возвращает token."""
+    global _warmup_active, _warmup_started, _warmup_token, _warmup_engine
+    with _progress_lock:
+        if value:
+            _warmup_token += 1
+            _warmup_started = time.monotonic()
+            _warmup_active = True
+            if engine:
+                _warmup_engine = str(engine)
+                _progress["engine"] = str(engine)
+            return _warmup_token
+        _warmup_active = False
+        return _warmup_token
+
+
+def end_warmup(token: int) -> None:
+    """Снять warming только если это всё ещё актуальная загрузка."""
+    global _warmup_active
+    with _progress_lock:
+        if token == _warmup_token:
+            _warmup_active = False
+
+
+def cancel_warmup_soft() -> str:
+    """Снять флаг warmup без убийства процесса. Возвращает engine, который грузился."""
+    global _warmup_active, _warmup_token, _warmup_engine
+    with _progress_lock:
+        was = str(_warmup_engine or "")
+        if _warmup_active:
+            _warmup_token += 1  # инвалидируем текущий token в finally warmup-потока
+            _warmup_active = False
+        return was
+
+
+def warmup_in_progress(engine: str | None = None) -> bool:
+    with _progress_lock:
+        if not _warmup_active:
+            return False
+        if engine is None:
+            return True
+        return str(_warmup_engine) == str(engine)
+
+
+def try_begin_warmup(engine: str) -> int | None:
+    """token / None (тот же движок уже грузится) / WARMUP_BUSY_OTHER."""
+    engine = str(engine or DEFAULT_ENGINE)
+    with _warmup_gate:
+        if warmup_in_progress(engine):
+            return None
+        if warmup_in_progress():
+            return WARMUP_BUSY_OTHER
+        return set_warmup_active(True, engine=engine)
+
+
+def wait_until_warmup_done(engine: str, timeout: float | None = None) -> bool:
+    """Не стартовать synth, пока bg-warmup того же движка не закончится.
+    True = можно говорить; False = stop / timeout.
+    """
+    limit = float(timeout if timeout is not None else WARMUP_STALE_SEC)
+    deadline = time.monotonic() + limit
+    waited = False
+    while warmup_in_progress(engine):
+        waited = True
+        if _stop_event.is_set():
+            debug_log(f"SPEAK wait warmup aborted (stop) engine={engine}")
+            return False
+        if time.monotonic() >= deadline:
+            debug_log(f"SPEAK wait warmup timeout engine={engine}")
+            return False
+        time.sleep(0.12)
+    if waited:
+        debug_log(f"SPEAK wait warmup done engine={engine}")
+    return True
+
+
+def _exit_process_soon() -> None:
+    time.sleep(0.15)
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    os._exit(0)
+
+
+def _elapsed_seconds_locked(*, warming: bool) -> int:
+    """Секунды фазы; на паузе не тикают (pause_mark замораживает конец интервала)."""
+    started = float(
+        _warmup_started if warming else _progress.get("phase_started", 0.0)
+    )
+    if not started:
+        return 0
+    accum = float(_progress.get("paused_accum", 0.0) or 0.0)
+    mark = float(_progress.get("pause_mark", 0.0) or 0.0)
+    end = mark if mark > 0 else time.monotonic()
+    return max(0, int(end - started - accum))
+
+
+def progress_snapshot() -> dict[str, object]:
+    with _progress_lock:
+        data = dict(_progress)
+        warming = _warmup_active
+        data["warming"] = warming
+        elapsed = _elapsed_seconds_locked(warming=warming)
+        data["elapsed_sec"] = elapsed
+        data["warmup_stale"] = bool(warming and elapsed >= WARMUP_STALE_SEC)
+    phase = str(data.get("phase", "idle"))
+    current = int(data.get("current", 0) or 0)
+    total = int(data.get("total", 0) or 0)
+    data["paused"] = is_paused()
+    data["queue"] = _speech_queue.qsize()
+    # % больше не для UI (модель не отдаёт); оставляем грубый индикатор кусков для отладки.
+    data["percent"] = 0
+    if total > 0 and phase == "playing":
+        data["percent"] = max(1, min(100, int(100 * current / total)))
+    elif total > 1 and phase == "synthesizing":
+        data["percent"] = max(0, min(99, int(100 * max(0, current - 1) / total)))
+    return data
+
+
+def load_config() -> dict:
+    data = {
+        "engine": DEFAULT_ENGINE,
+        "local_speaker": DEFAULT_LOCAL_SPEAKER,
+        "openai_voice": DEFAULT_OPENAI_VOICE,
+        "edge_voice": DEFAULT_EDGE_VOICE,
+        "tera_voice": DEFAULT_TERA_VOICE,
+        "tera_duration_scale": DEFAULT_TERA_DURATION_SCALE,
+        "hybrid_mode": DEFAULT_HYBRID_MODE,
+        "lang_switch_pause_ms": DEFAULT_LANG_SWITCH_PAUSE_MS,
+        "qwen_model": DEFAULT_QWEN_MODEL,
+        "qwen_speaker": DEFAULT_QWEN_SPEAKER,
+        "micro_wife_design_file": DEFAULT_QWEN_DESIGN,
+        "volume": DEFAULT_VOLUME / 100.0,
+        "interrupt_on_new": False,
+    }
+    if CONFIG_FILE.is_file():
+        try:
+            raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            engine = str(raw.get("engine", DEFAULT_ENGINE)).strip().lower()
+            if engine in _DEAD_ENGINES:
+                engine = "edge" if engine == "kokoro" else "local"
+            data["engine"] = engine if engine in _ENGINES else DEFAULT_ENGINE
+            local_speaker = str(
+                raw.get("local_speaker", DEFAULT_LOCAL_SPEAKER)
+            ).strip().lower()
+            data["local_speaker"] = local_speaker or DEFAULT_LOCAL_SPEAKER
+            openai_voice = str(
+                raw.get("openai_voice", DEFAULT_OPENAI_VOICE)
+            ).strip().lower()
+            data["openai_voice"] = openai_voice or DEFAULT_OPENAI_VOICE
+            edge_voice = str(raw.get("edge_voice", DEFAULT_EDGE_VOICE)).strip()
+            data["edge_voice"] = edge_voice or DEFAULT_EDGE_VOICE
+            tera_voice = str(raw.get("tera_voice", DEFAULT_TERA_VOICE)).strip()
+            data["tera_voice"] = tera_voice or DEFAULT_TERA_VOICE
+            try:
+                from speak_tera import normalize_duration_scale
+
+                data["tera_duration_scale"] = normalize_duration_scale(
+                    raw.get("tera_duration_scale", DEFAULT_TERA_DURATION_SCALE)
+                )
+            except Exception:
+                data["tera_duration_scale"] = DEFAULT_TERA_DURATION_SCALE
+            hybrid = str(raw.get("hybrid_mode", DEFAULT_HYBRID_MODE)).strip().lower()
+            if hybrid == "dict_and_en":
+                hybrid = "dict_only"
+            data["hybrid_mode"] = hybrid if hybrid in _HYBRID_MODES else DEFAULT_HYBRID_MODE
+            data["qwen_model"] = (
+                str(raw.get("qwen_model", DEFAULT_QWEN_MODEL)).strip() or DEFAULT_QWEN_MODEL
+            )
+            data["qwen_speaker"] = (
+                str(raw.get("qwen_speaker", DEFAULT_QWEN_SPEAKER)).strip()
+                or DEFAULT_QWEN_SPEAKER
+            )
+            data["micro_wife_design_file"] = (
+                str(raw.get("micro_wife_design_file", DEFAULT_QWEN_DESIGN)).strip()
+                or DEFAULT_QWEN_DESIGN
+            )
+            try:
+                data["lang_switch_pause_ms"] = max(
+                    0,
+                    min(400, int(raw.get("lang_switch_pause_ms", DEFAULT_LANG_SWITCH_PAUSE_MS))),
+                )
+            except (TypeError, ValueError):
+                data["lang_switch_pause_ms"] = DEFAULT_LANG_SWITCH_PAUSE_MS
+            data["volume"] = max(10, min(100, int(raw.get("volume", DEFAULT_VOLUME)))) / 100.0
+            data["interrupt_on_new"] = bool(raw.get("interrupt_on_new", False))
+            try:
+                data["pause_ms"] = max(
+                    0, min(2000, int(raw.get("pause_ms", DEFAULT_PAUSE_MS)))
+                )
+            except (TypeError, ValueError):
+                data["pause_ms"] = DEFAULT_PAUSE_MS
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            pass
+    if "pause_ms" not in data:
+        data["pause_ms"] = DEFAULT_PAUSE_MS
+    if "qwen_model" not in data:
+        data["qwen_model"] = DEFAULT_QWEN_MODEL
+    if "qwen_speaker" not in data:
+        data["qwen_speaker"] = DEFAULT_QWEN_SPEAKER
+    if "micro_wife_design_file" not in data:
+        data["micro_wife_design_file"] = DEFAULT_QWEN_DESIGN
+    if "tera_voice" not in data:
+        data["tera_voice"] = DEFAULT_TERA_VOICE
+    if "tera_duration_scale" not in data:
+        data["tera_duration_scale"] = DEFAULT_TERA_DURATION_SCALE
+    return data
+
+
+PAUSE_FLAG = ROOT / "TTS_PAUSED"
+
+
+def _sync_pause_flag(paused: bool) -> None:
+    """Файл-индикатор для панели/AHK: есть = на паузе, нет = играет/готово."""
+    try:
+        if paused:
+            PAUSE_FLAG.write_text("1", encoding="ascii")
+        else:
+            PAUSE_FLAG.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def is_paused() -> bool:
+    with _pause_lock:
+        return _paused
+
+
+def set_paused(value: bool) -> None:
+    global _paused
+    with _pause_lock:
+        was = _paused
+        _paused = value
+    _sync_pause_flag(value)
+    # Таймер фазы не должен тикать на паузе (иначе «22 с» растёт, пока звук стоит).
+    with _progress_lock:
+        if value and not was:
+            if float(_progress.get("pause_mark", 0.0) or 0.0) <= 0:
+                _progress["pause_mark"] = time.monotonic()
+        elif not value and was:
+            mark = float(_progress.get("pause_mark", 0.0) or 0.0)
+            if mark > 0:
+                _progress["paused_accum"] = float(
+                    _progress.get("paused_accum", 0.0) or 0.0
+                ) + (time.monotonic() - mark)
+            _progress["pause_mark"] = 0.0
+
+
+def wait_while_paused() -> bool:
+    """Ждёт resume. True = можно продолжать, False = stop."""
+    while is_paused():
+        if _stop_event.is_set():
+            return False
+        time.sleep(0.05)
+    return not _stop_event.is_set()
+
+
+def pause_after_chunk(part: str, base_ms: int) -> None:
+    """Пауза между кусками: дольше после .!? , короче после запятой, 0 если стоп/pause."""
+    if base_ms <= 0 or _stop_event.is_set() or is_paused():
+        return
+    stripped = part.rstrip()
+    if not stripped:
+        return
+    end = stripped[-1]
+    if end in ".!?…":
+        delay = int(base_ms * 1.4)  # ~ sentence / paragraph
+    elif end in ",:;":
+        delay = int(base_ms * 0.6)
+    else:
+        delay = base_ms
+    delay = max(80, min(2000, delay))
+    end_at = time.monotonic() + delay / 1000.0
+    while time.monotonic() < end_at:
+        if _stop_event.is_set() or is_paused():
+            return
+        time.sleep(0.05)
+
+
+def ensure_mixer() -> None:
+    global _mixer_ready
+    import pygame
+
+    if not _mixer_ready:
+        pygame.mixer.init()
+        _mixer_ready = True
+
+
+def stop_playback() -> None:
+    """Полный stop: обрыв текущего play. Очередь чистит вызывающий.
+
+    Worker Kokoro убиваем ТОЛЬКО на phase=synthesizing.
+    Раньше убивали ещё и на warmup / любом Stop → каждый interrupt и Стоп
+    срывали прогрев, Speak снова грузил модель 20–60 с («44 секунды» и рост).
+    Играет wav → pygame.stop + stop_event, worker живой.
+    """
+    set_paused(False)
+    _stop_event.set()
+    try:
+        import pygame
+
+        if _mixer_ready:
+            pygame.mixer.music.stop()
+    except Exception:
+        pass
+
+    with _progress_lock:
+        phase = str(_progress.get("phase", "idle"))
+    if phase == "synthesizing":
+        try:
+            from speak_kokoro import cancel_current
+
+            cancel_current()
+            debug_log("STOP kill_kokoro_worker phase=synthesizing")
+        except Exception as error:
+            debug_log(f"STOP kill_kokoro_worker skip: {error}")
+    else:
+        debug_log(f"STOP keep_kokoro_worker phase={phase}")
+
+
+def _prepare_engine(engine: str) -> None:
+    """При смене движка освобождаем чужой runtime (VRAM / orphan kokoro worker)."""
+    if engine in {"local", "edge", "tera", "openai"}:
+        try:
+            micro = Path(__file__).resolve().parent / "micro_wife"
+            if str(micro) not in sys.path:
+                sys.path.insert(0, str(micro))
+            from speak_qwen import unload as unload_qwen
+
+            unload_qwen()
+        except Exception as error:
+            debug_log(f"unload qwen skip: {error}")
+    # kokoro убран из стека — на всякий гасим зависшие worker'ы
+    if engine in {"local", "edge", "tera", "qwen", "openai"}:
+        try:
+            from speak_kokoro import stop_worker
+
+            stop_worker()
+        except Exception as error:
+            debug_log(f"stop kokoro worker skip: {error}")
+
+
+def _normalize_openai_voice(voice: str | None) -> str:
+    from speak_openai import normalize_voice
+
+    return normalize_voice(voice)
+
+
+def _normalize_edge_voice(voice: str | None) -> str:
+    from speak_edge_tts import normalize_voice
+
+    return normalize_voice(voice)
+
+
+def _normalize_tera_voice(voice: str | None) -> str:
+    from speak_tera import normalize_voice
+
+    return normalize_voice(voice)
+
+
+def _normalize_local_speaker(speaker: str | None) -> str:
+    from speak_local import DEFAULT_LOCAL_SPEAKER as silero_default
+    from speak_local import LOCAL_SPEAKERS
+
+    known = {code for code, _ in LOCAL_SPEAKERS}
+    v = (speaker or silero_default).strip().lower() or silero_default
+    return v if v in known else silero_default
+
+
+def playback_pausable() -> bool:
+    """Пауза имеет смысл только пока идёт озвучка / синтез / очередь."""
+    with _progress_lock:
+        phase = str(_progress.get("phase", "idle")).strip().lower()
+        warming = _warmup_active
+    if warming:
+        return False
+    if phase in {"preparing", "synthesizing", "playing"}:
+        return True
+    if _speech_queue.qsize() > 0:
+        return True
+    if _mixer_ready:
+        try:
+            import pygame
+
+            if pygame.mixer.music.get_busy():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def pause_playback() -> bool:
+    """Pause: pygame pause(), очередь и текущий кусок не сбрасывать."""
+    if not playback_pausable():
+        if is_paused():
+            set_paused(False)
+        return False
+    set_paused(True)
+    try:
+        import pygame
+
+        if _mixer_ready:
+            pygame.mixer.music.pause()
+    except Exception:
+        pass
+    return True
+
+
+def resume_playback() -> None:
+    set_paused(False)
+    try:
+        import pygame
+
+        if _mixer_ready:
+            pygame.mixer.music.unpause()
+    except Exception:
+        pass
+
+
+def clear_speech_queue() -> int:
+    cleared = 0
+    while True:
+        try:
+            _speech_queue.get_nowait()
+            cleared += 1
+            _speech_queue.task_done()
+        except queue.Empty:
+            break
+    return cleared
+
+
+def _next_queue_seq() -> int:
+    global _queue_seq
+    with _queue_seq_lock:
+        _queue_seq += 1
+        return _queue_seq
+
+
+def _remember_auto(item: SpeechItem) -> None:
+    key = (item.conversation_id, item.generation_id)
+    if not key[0] or not key[1]:
+        return
+    with _recent_auto_lock:
+        if key in _recent_auto_ids_set:
+            return
+        if len(_recent_auto_ids) >= _recent_auto_ids.maxlen:
+            old = _recent_auto_ids.popleft()
+            _recent_auto_ids_set.discard(old)
+        _recent_auto_ids.append(key)
+        _recent_auto_ids_set.add(key)
+
+
+def _is_duplicate_auto(item: SpeechItem) -> bool:
+    if item.source not in AUTO_SOURCES:
+        return False
+    key = (item.conversation_id, item.generation_id)
+    if not key[0] or not key[1]:
+        return False
+    with _recent_auto_lock:
+        return key in _recent_auto_ids_set
+
+
+def _coerce_item(data: dict, *, default_source: str) -> SpeechItem:
+    text = str(data.get("text", "")).strip()
+    source = str(data.get("source") or default_source).strip() or default_source
+    conv = str(data.get("conversation_id") or "").strip()
+    gen = str(data.get("generation_id") or "").strip()
+    try:
+        priority = int(data.get("priority", 100))
+    except (TypeError, ValueError):
+        priority = 100
+    return SpeechItem(
+        text=text,
+        source=source,
+        conversation_id=conv,
+        generation_id=gen,
+        priority=priority,
+    )
+
+
+def enqueue_speech(item: SpeechItem) -> tuple[int, bool]:
+    if item.source in AUTO_SOURCES and item.conversation_id and item.generation_id:
+        with _recent_auto_lock:
+            key = (item.conversation_id, item.generation_id)
+            if key in _recent_auto_ids_set:
+                debug_log(
+                    "QUEUE_SKIP_DUP "
+                    f"source={item.source} conv={item.conversation_id[:12]} gen={item.generation_id[:12]}"
+                )
+                return _speech_queue.qsize(), True
+            if len(_recent_auto_ids) >= _recent_auto_ids.maxlen:
+                old = _recent_auto_ids.popleft()
+                _recent_auto_ids_set.discard(old)
+            _recent_auto_ids.append(key)
+            _recent_auto_ids_set.add(key)
+    _speech_queue.put((item.priority, _next_queue_seq(), item))
+    size = _speech_queue.qsize()
+    debug_log(
+        "QUEUE_ADD "
+        f"source={item.source} chars={len(item.text)} queue_size={size} "
+        f"conv={item.conversation_id[:12]} gen={item.generation_id[:12]}"
+    )
+    return size, False
+
+
+def _speech_worker() -> None:
+    while True:
+        _priority, _seq, item = _speech_queue.get()
+        try:
+            if item is None:
+                return
+            if len(item.text) >= 2:
+                speak_text(item)
+        finally:
+            _speech_queue.task_done()
+
+
+def ensure_worker() -> None:
+    global _worker_started
+    with _worker_lock:
+        if _worker_started:
+            return
+        thread = threading.Thread(target=_speech_worker, name="tts-queue", daemon=True)
+        thread.start()
+        _worker_started = True
+        debug_log("QUEUE_WORKER started")
+
+
+CHUNK_TARGET = 900  # символов на кусок (legacy; kokoro/qwen режут в _parts_for_engine)
+
+FAST_START = 220
+
+
+def split_into_chunks(text: str, target: int = CHUNK_TARGET) -> list[str]:
+    """Режет длинный текст на куски по предложениям/пробелам."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= target:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+    length = len(text)
+
+    while start < length:
+        if length - start <= target:
+            chunk = text[start:].strip()
+            if chunk:
+                chunks.append(chunk)
+            break
+
+        end = min(start + target, length)
+        window = text[start:end]
+
+        cut = -1
+        for i in range(len(window) - 1, max(len(window) // 3, 0), -1):
+            if window[i] in ".!?\n;":
+                cut = i + 1
+                break
+        if cut < 0:
+            space = window.rfind(" ")
+            cut = space if space > len(window) // 3 else len(window)
+
+        chunk = text[start : start + cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += cut
+        while start < length and text[start].isspace():
+            start += 1
+
+    return chunks
+
+
+def split_for_speech(text: str) -> list[str]:
+    """Короткий первый кусок + остальные части по ~900 символов."""
+    text = text.strip()
+    if len(text) <= FAST_START:
+        return [text]
+
+    window = text[:320]
+    cut = -1
+    for i, ch in enumerate(window):
+        if i < 80:
+            continue
+        if ch in ".!?\n":
+            cut = i + 1
+            break
+    if cut < 0:
+        cut = min(180, len(text))
+        while cut < len(text) and not text[cut].isspace():
+            cut += 1
+            if cut > 260:
+                break
+
+    first = text[:cut].strip()
+    rest = text[cut:].strip()
+    if not first:
+        return split_into_chunks(text)
+    if not rest:
+        return [first]
+    return [first] + split_into_chunks(rest)
+
+
+def play_file(mp3_path: Path, volume: float) -> bool:
+    """Играть до конца. True = дослушали, False = hard stop.
+    get_busy() на паузе False — не считать это концом файла.
+    """
+    import pygame
+
+    ensure_mixer()
+    if mp3_path.stat().st_size < 64:
+        return False
+    if _stop_event.is_set():
+        return False
+    if is_paused() and not wait_while_paused():
+        return False
+    try:
+        pygame.mixer.music.load(str(mp3_path))
+        pygame.mixer.music.set_volume(volume)
+        pygame.mixer.music.play()
+        mixer_paused = False
+        while True:
+            if _stop_event.is_set():
+                pygame.mixer.music.stop()
+                return False
+            if is_paused():
+                if not mixer_paused:
+                    pygame.mixer.music.pause()
+                    mixer_paused = True
+                pygame.time.wait(40)
+                continue
+            if mixer_paused:
+                pygame.mixer.music.unpause()
+                mixer_paused = False
+            if pygame.mixer.music.get_busy():
+                pygame.time.wait(40)
+                continue
+            pygame.time.wait(20)
+            if is_paused() or pygame.mixer.music.get_busy():
+                continue
+            return True
+    finally:
+        try:
+            pygame.mixer.music.unload()
+        except Exception:
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        try:
+            time.sleep(0.05)
+            path.unlink(missing_ok=True)
+        except OSError:
+            debug_log(f"UNLINK_FAIL path={path}")
+
+
+def _audio_suffix(engine: str) -> str:
+    if engine == "edge":
+        return ".mp3"
+    return ".wav"
+
+
+def render_audio(part: str, cfg: dict, out_path: Path, lang: str = "ru") -> None:
+    """local / edge / kokoro / qwen / openai → audio.
+    Смену движка (_prepare_engine) делает speak_text/warmup один раз — не на каждый chunk.
+    """
+    del lang  # EN hybrid убран вместе с Piper
+    engine = cfg["engine"]
+    if engine == "local":
+        from speak_local import synthesize_wav as synthesize_local
+
+        synthesize_local(
+            part,
+            _normalize_local_speaker(cfg.get("local_speaker", DEFAULT_LOCAL_SPEAKER)),
+            out_path,
+        )
+        return
+    if engine == "edge":
+        from speak_edge_tts import synthesize_wav as synthesize_edge
+
+        synthesize_edge(
+            part,
+            out_path,
+            voice=_normalize_edge_voice(cfg.get("edge_voice", DEFAULT_EDGE_VOICE)),
+        )
+        return
+    if engine == "tera":
+        from speak_tera import normalize_duration_scale
+        from speak_tera import synthesize_wav as synthesize_tera
+
+        synthesize_tera(
+            part,
+            out_path,
+            voice=_normalize_tera_voice(cfg.get("tera_voice", DEFAULT_TERA_VOICE)),
+            duration_scale=normalize_duration_scale(
+                cfg.get("tera_duration_scale", DEFAULT_TERA_DURATION_SCALE)
+            ),
+        )
+        return
+    if engine == "qwen":
+        micro = Path(__file__).resolve().parent / "micro_wife"
+        if str(micro) not in sys.path:
+            sys.path.insert(0, str(micro))
+        from speak_qwen import synthesize_wav as synthesize_qwen
+        from speak_qwen import speaker_for_design
+
+        design_file = cfg.get("micro_wife_design_file", DEFAULT_QWEN_DESIGN)
+        # speaker всегда из пресета design (конфиг мог залипнуть на serena)
+        synthesize_qwen(
+            part,
+            out_path,
+            design_file=design_file,
+            model_id=cfg.get("qwen_model", DEFAULT_QWEN_MODEL),
+            speaker=speaker_for_design(design_file),
+            language="russian",
+        )
+        return
+    if engine == "openai":
+        from speak_openai import synthesize_wav as synthesize_openai
+
+        synthesize_openai(
+            part,
+            out_path,
+            voice=_normalize_openai_voice(cfg.get("openai_voice", DEFAULT_OPENAI_VOICE)),
+        )
+        return
+    raise ValueError(f"unknown engine: {engine}")
+
+
+def _looks_like_table_speech(text: str) -> bool:
+    head = text.lstrip()[:120]
+    if head.startswith("Столбцы:"):
+        return True
+    # Много коротких предложений подряд — типичные строки таблицы
+    dots = text.count(". ")
+    return dots >= 4 and (len(text) / max(dots, 1)) < 90
+
+
+def _parts_for_engine(text: str, engine: str) -> list[str]:
+    table_like = _looks_like_table_speech(text)
+    if engine == "local":
+        # Silero режет длинные куски сам (~900); держим умеренно.
+        return split_into_chunks(text, target=140 if table_like else 280)
+    if engine == "edge":
+        # Сеть: крупнее куски = меньше round-trip; Edge держит длинные фразы.
+        return split_into_chunks(text, target=500 if table_like else 900)
+    if engine == "tera":
+        # Локальный ONNX: умеренные куски, без микронарезок.
+        return split_into_chunks(text, target=220 if table_like else 420)
+    if engine == "qwen":
+        # Короткие куски на Qwen дают хуже RTF (фиксированный overhead generate).
+        # table_like раньше резал до 120 — это усугубляло; держим крупные куски.
+        return split_into_chunks(text, target=420)
+    if engine == "openai":
+        # Сеть+API: крупнее куски = меньше round-trip (лимит OpenAI ~4096).
+        return split_into_chunks(text, target=900)
+    return split_into_chunks(text, target=160 if table_like else 400)
+
+
+def _effective_hybrid(cfg: dict) -> str:
+    mode = str(cfg.get("hybrid_mode", DEFAULT_HYBRID_MODE)).strip().lower()
+    if mode not in _HYBRID_MODES:
+        mode = DEFAULT_HYBRID_MODE
+    return "off" if mode == "off" else "dict_only"
+
+
+def _speech_units(text: str, cfg: dict) -> list[tuple[str, str]]:
+    """Куски [(текст, lang)]. Всегда ru после удаления Piper EN hybrid."""
+    hybrid = _effective_hybrid(cfg)
+    engine = str(cfg.get("engine", DEFAULT_ENGINE))
+    prepared = text
+    try:
+        from text_prep import finalize_speech_text
+
+        prepared = finalize_speech_text(text, apply_dict=hybrid != "off")
+    except Exception as error:
+        debug_log(f"text_prep skipped: {error}")
+    return [(chunk, "ru") for chunk in _parts_for_engine(prepared, engine) if chunk]
+
+
+def speak_text(item: SpeechItem) -> None:
+    with _speak_lock:
+        _stop_event.clear()
+        set_paused(False)
+        cfg = load_config()
+        engine = str(cfg["engine"])
+        set_progress(
+            "preparing",
+            engine=engine,
+            current=0,
+            total=0,
+            source=item.source,
+            conversation_id=item.conversation_id,
+            generation_id=item.generation_id,
+        )
+        # Не гоняем synth параллельно с bg-warmup (Kokoro/Qwen иначе ловят stale/двойную load).
+        if not wait_until_warmup_done(engine):
+            set_progress(
+                "idle",
+                engine=engine,
+                current=0,
+                total=0,
+                source="",
+                conversation_id="",
+                generation_id="",
+            )
+            return
+        units = _speech_units(item.text, cfg)
+        if not units:
+            set_progress(
+                "idle",
+                engine=engine,
+                current=0,
+                total=0,
+                source="",
+                conversation_id="",
+                generation_id="",
+            )
+            return
+        hybrid = _effective_hybrid(cfg)
+        debug_log(
+            f"ENGINE={cfg['engine']} hybrid={hybrid} units={len(units)} "
+            f"source={item.source} conv={item.conversation_id[:12]} gen={item.generation_id[:12]}"
+        )
+        log_speak_start(len(item.text), len(units))
+        ok_parts = 0
+        fail_parts = 0
+        suffix = _audio_suffix(cfg["engine"])
+        pause_ms = int(cfg.get("pause_ms", DEFAULT_PAUSE_MS))
+        switch_ms = int(cfg.get("lang_switch_pause_ms", DEFAULT_LANG_SWITCH_PAUSE_MS))
+        # Без prefetch: Kokoro/Qwen делят lock/VRAM; сирота после Stop вешала следующий Speak.
+        _prepare_engine(str(cfg["engine"]))
+        current_path: Path | None = None
+
+        try:
+            index = 0
+            while index < len(units):
+                if _stop_event.is_set():
+                    break
+                if is_paused():
+                    if not wait_while_paused():
+                        break
+                    continue
+
+                part, lang = units[index]
+                if len(part) < 2:
+                    index += 1
+                    continue
+                debug_log(
+                    f"CHUNK_BEGIN {index + 1}/{len(units)} lang={lang} "
+                    f"chars={len(part)} preview={part[:80]!r}"
+                )
+                set_progress(
+                    "synthesizing",
+                    engine=engine,
+                    current=index + 1,
+                    total=len(units),
+                    source=item.source,
+                    conversation_id=item.conversation_id,
+                    generation_id=item.generation_id,
+                )
+
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    current_path = Path(tmp.name)
+                try:
+                    render_audio(part, cfg, current_path, lang)
+                except Exception as error:
+                    fail_parts += 1
+                    log_chunk_fail(index + 1, len(units), part, error)
+                    _safe_unlink(current_path)
+                    current_path = None
+                    index += 1
+                    continue
+
+                if current_path.stat().st_size < 64:
+                    fail_parts += 1
+                    log_chunk_fail(
+                        index + 1,
+                        len(units),
+                        part,
+                        RuntimeError("empty audio"),
+                    )
+                    _safe_unlink(current_path)
+                    current_path = None
+                    index += 1
+                    continue
+
+                set_progress(
+                    "playing",
+                    engine=engine,
+                    current=index + 1,
+                    total=len(units),
+                    source=item.source,
+                    conversation_id=item.conversation_id,
+                    generation_id=item.generation_id,
+                )
+                finished = play_file(current_path, cfg["volume"])
+                _safe_unlink(current_path)
+                current_path = None
+                if not finished or _stop_event.is_set():
+                    break
+                ok_parts += 1
+                log_chunk_ok(index + 1, len(units), part)
+                index += 1
+                if index >= len(units):
+                    break
+                pause_after_chunk(part, pause_ms)
+                if units[index][1] != lang and switch_ms > 0:
+                    end_at = time.monotonic() + switch_ms / 1000.0
+                    while time.monotonic() < end_at:
+                        if _stop_event.is_set() or is_paused():
+                            break
+                        time.sleep(0.02)
+                if is_paused() and not wait_while_paused():
+                    break
+        finally:
+            if current_path is not None:
+                _safe_unlink(current_path)
+            set_progress(
+                "idle",
+                engine=engine,
+                current=0,
+                total=0,
+                source="",
+                conversation_id="",
+                generation_id="",
+            )
+
+        log_speak_done(ok_parts, fail_parts, len(units))
+
+
+def _run_engine_warmup(engine: str, cfg: dict, *, bg: bool) -> None:
+    """Реальная загрузка. Вызывать только после try_begin_warmup."""
+    prefix = "WARMUP bg" if bg else "WARMUP"
+    _prepare_engine(engine)
+    if engine == "local":
+        from speak_local import warmup as warmup_local
+
+        debug_log(f"{prefix} local begin")
+        warmup_local()
+        debug_log(f"{prefix} local done")
+        return
+    if engine == "qwen":
+        micro = Path(__file__).resolve().parent / "micro_wife"
+        if str(micro) not in sys.path:
+            sys.path.insert(0, str(micro))
+        from speak_qwen import warmup as warmup_qwen
+
+        debug_log(f"{prefix} qwen begin")
+        warmup_qwen(cfg.get("qwen_model", DEFAULT_QWEN_MODEL))
+        debug_log(f"{prefix} qwen done")
+        return
+    if engine == "openai":
+        from speak_openai import warmup as warmup_openai
+
+        debug_log(f"{prefix} openai begin")
+        warmup_openai(cfg.get("openai_voice", DEFAULT_OPENAI_VOICE))
+        debug_log(f"{prefix} openai done")
+        return
+    if engine == "edge":
+        from speak_edge_tts import warmup as warmup_edge
+
+        debug_log(f"{prefix} edge begin")
+        warmup_edge(cfg.get("edge_voice", DEFAULT_EDGE_VOICE))
+        debug_log(f"{prefix} edge done")
+        return
+    if engine == "tera":
+        from speak_tera import warmup as warmup_tera
+
+        debug_log(f"{prefix} tera begin")
+        warmup_tera(
+            cfg.get("tera_voice", DEFAULT_TERA_VOICE),
+            cfg.get("tera_duration_scale", DEFAULT_TERA_DURATION_SCALE),
+        )
+        debug_log(f"{prefix} tera done")
+        return
+    debug_log(f"{prefix} skip (engine={engine})")
+
+
+def handle_client(conn: socket.socket) -> None:
+    with conn:
+        raw = b""
+        while not raw.endswith(b"\n"):
+            piece = conn.recv(4096)
+            if not piece:
+                break
+            raw += piece
+            if len(raw) > 600_000:
+                break
+        try:
+            data = json.loads(raw.decode("utf-8").strip() or "{}")
+        except json.JSONDecodeError:
+            conn.sendall(b'{"ok":false,"error":"bad json"}\n')
+            return
+
+        cmd = str(data.get("cmd", "")).lower()
+        if cmd == "ping":
+            conn.sendall(b'{"ok":true,"pong":true}\n')
+            return
+        if cmd == "status":
+            status = progress_snapshot()
+            status["ok"] = True
+            conn.sendall(
+                json.dumps(status, ensure_ascii=False).encode("utf-8")
+                + b"\n"
+            )
+            return
+        if cmd == "warmup":
+            cfg = load_config()
+            engine = str(cfg.get("engine", DEFAULT_ENGINE))
+            set_progress("idle", engine=engine, current=0, total=0)
+            token = try_begin_warmup(engine)
+            if token is None:
+                conn.sendall(
+                    json.dumps(
+                        {"ok": True, "warmed": "in_progress", "engine": engine},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                return
+            if token == WARMUP_BUSY_OTHER:
+                debug_log(f"WARMUP skip other engine in flight want={engine}")
+                conn.sendall(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "engine_switch_needs_restart",
+                            "warming_engine": _warmup_engine,
+                        },
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                return
+            try:
+                _run_engine_warmup(engine, cfg, bg=False)
+                conn.sendall(
+                    json.dumps(
+                        {"ok": True, "warmed": True, "engine": engine},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+            except Exception as error:
+                debug_log(f"WARMUP {engine} fail: {error}")
+                conn.sendall(
+                    json.dumps(
+                        {"ok": False, "error": str(error)},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+            finally:
+                end_warmup(token)
+            return
+        if cmd == "pause":
+            paused = pause_playback()
+            debug_log(f"PAUSE ok={paused}")
+            conn.sendall(
+                (
+                    json.dumps({"ok": True, "paused": paused}, ensure_ascii=False)
+                    + "\n"
+                ).encode("utf-8")
+            )
+            return
+        if cmd == "resume":
+            resume_playback()
+            debug_log("RESUME")
+            conn.sendall(b'{"ok":true,"paused":false}\n')
+            return
+        if cmd == "pause_toggle":
+            if is_paused():
+                resume_playback()
+                debug_log("PAUSE_TOGGLE -> resume")
+                conn.sendall(b'{"ok":true,"paused":false}\n')
+            else:
+                paused = pause_playback()
+                debug_log(f"PAUSE_TOGGLE -> pause ok={paused}")
+                conn.sendall(
+                    (
+                        json.dumps({"ok": True, "paused": paused}, ensure_ascii=False)
+                        + "\n"
+                    ).encode("utf-8")
+                )
+            return
+        if cmd == "stop":
+            cleared = clear_speech_queue()
+            stop_playback()
+            warming = warmup_in_progress()
+            warming_engine = ""
+            if warming:
+                with _progress_lock:
+                    warming_engine = str(_warmup_engine or "")
+            debug_log(
+                f"STOP cleared_queue={cleared} warming={warming} eng={warming_engine}"
+            )
+            conn.sendall(b'{"ok":true,"stopped":true}\n')
+            if warming and warming_engine in _FORCE_EXIT_ON_WARMUP_STOP:
+                # CUDA from_pretrained не прерывается — только Qwen убиваем процесс.
+                debug_log("STOP abort warmup — process exit (qwen)")
+                threading.Thread(
+                    target=_exit_process_soon, name="tts-abort-warmup", daemon=True
+                ).start()
+            elif warming:
+                # Tera/Edge/Silero: НЕ срываем warmup. Иначе Прослушать/Стоп
+                # отменяют загрузку, а synth грузит модель 30–90 с «в тишине».
+                debug_log(f"STOP keep warmup running eng={warming_engine}")
+            return
+        if cmd in {"enqueue_auto", "enqueue_manual", "preview", "speak"}:
+            cfg = load_config()
+            ensure_worker()
+            if cmd == "speak":
+                item = _coerce_item({"text": data.get("text", ""), "source": SOURCE_MANUAL}, default_source=SOURCE_MANUAL)
+            else:
+                raw_item = data.get("entry")
+                if not isinstance(raw_item, dict):
+                    raw_item = {"text": data.get("text", "")}
+                default_source = {
+                    "enqueue_auto": SOURCE_AFTER_AGENT,
+                    "enqueue_manual": SOURCE_MANUAL,
+                    "preview": SOURCE_PREVIEW,
+                }.get(cmd, SOURCE_MANUAL)
+                item = _coerce_item(raw_item, default_source=default_source)
+
+            if cfg.get("interrupt_on_new") and item.source not in AUTO_SOURCES:
+                if _speak_lock.locked() or _speech_queue.qsize() > 0:
+                    log_interrupted("interrupt_on_new=true")
+                cleared = clear_speech_queue()
+                stop_playback()
+                debug_log(f"INTERRUPT cleared_queue={cleared}")
+            if len(item.text) >= 2:
+                size, duplicate = enqueue_speech(item)
+                conn.sendall(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "queued": not duplicate,
+                            "duplicate": duplicate,
+                            "queue_size": size,
+                        },
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+            else:
+                conn.sendall(b'{"ok":true,"queued":false}\n')
+            return
+        conn.sendall(b'{"ok":false,"error":"unknown cmd"}\n')
+
+
+def already_running() -> bool:
+    try:
+        with socket.create_connection((HOST, PORT), timeout=0.3) as sock:
+            sock.sendall(b'{"cmd":"ping"}\n')
+            sock.recv(256)
+        return True
+    except OSError:
+        return False
+
+
+def _configure_server_socket(server: socket.socket, platform: str = sys.platform) -> None:
+    """Make the daemon listener exclusive, especially on Windows.
+
+    SO_REUSEADDR on Windows can let multiple processes bind the same address.
+    That creates several independent queues/stop events and makes clients reach
+    an arbitrary daemon.  EXCLUSIVEADDRUSE is the Windows singleton primitive.
+    """
+    if platform == "win32":
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive is not None:
+            server.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        return
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
+def warmup_engine_background() -> None:
+    """Не блокирует accept: Silero/kokoro/qwen грузятся в фоне после старта."""
+
+    def run() -> None:
+        cfg = load_config()
+        engine = str(cfg.get("engine") or DEFAULT_ENGINE)
+        set_progress("idle", engine=engine, current=0, total=0)
+        token = try_begin_warmup(engine)
+        if token is None:
+            debug_log(f"WARMUP bg skip in_progress engine={engine}")
+            return
+        if token == WARMUP_BUSY_OTHER:
+            debug_log(f"WARMUP bg skip other engine want={engine}")
+            return
+        try:
+            _run_engine_warmup(engine, cfg, bg=True)
+        except Exception as error:
+            debug_log(f"WARMUP bg {engine} fail: {error}")
+        finally:
+            end_warmup(token)
+
+    threading.Thread(target=run, name="tts-warmup", daemon=True).start()
+
+
+def _warmup_watchdog() -> None:
+    """Если загрузка живая дольше лимита — процесс мёртвый, GPU надо отдать."""
+    while True:
+        time.sleep(1.0)
+        try:
+            snap = progress_snapshot()
+        except Exception:
+            continue
+        if snap.get("warmup_stale"):
+            debug_log(
+                f"WARMUP stale {snap.get('elapsed_sec')}s engine={snap.get('engine')} — process exit"
+            )
+            try:
+                PID_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
+            os._exit(1)
+
+
+def main() -> int:
+    if already_running():
+        return 0
+
+    # Порт захватываем ДО pygame/worker/Qwen warmup. Если несколько клиентов
+    # одновременно стартуют демон, проигравшие выходят без загрузки модели и RAM.
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _configure_server_socket(server)
+    try:
+        server.bind((HOST, PORT))
+    except OSError:
+        server.close()
+        return 0
+    server.listen(8)
+    server.settimeout(1.0)
+
+    PID_FILE.write_text(str(os.getpid()), encoding="ascii")
+    ensure_mixer()
+    ensure_worker()
+    warmup_engine_background()
+    threading.Thread(
+        target=_warmup_watchdog, name="tts-warmup-watchdog", daemon=True
+    ).start()
+
+    try:
+        while True:
+            try:
+                conn, _addr = server.accept()
+            except socket.timeout:
+                continue
+            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_playback()
+        try:
+            from speak_kokoro import stop_worker
+
+            stop_worker()
+        except Exception:
+            pass
+        try:
+            micro = Path(__file__).resolve().parent / "micro_wife"
+            if str(micro) not in sys.path:
+                sys.path.insert(0, str(micro))
+            from speak_qwen import unload as unload_qwen
+
+            unload_qwen()
+        except Exception:
+            pass
+        server.close()
+        PID_FILE.unlink(missing_ok=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

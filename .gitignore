@@ -36,3 +36,6 @@ micro_wife/checkpoints/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+tts_daemon.pid
+

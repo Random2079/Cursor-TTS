@@ -1,11 +1,20 @@
-# Cursor hooks (этот репозиторий)
+# Hooks в репозитории
 
-Хук лежит в `hooks/tts_after_response.py`.
+**Важно:** Cursor не включает авто-озвучку «сам из git clone».
 
-**Не правь `hooks.json` здесь вручную с абсолютными путями** — Cursor читает user-level конфиг:
+Один раз на машине:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install_cursor_hook.ps1
 ```
 
-Скрипт допишет `afterAgentResponse` и `stop` в `%USERPROFILE%\.cursor\hooks.json`, вызывая `run_hook.cmd` из корня репозитория.
+Скрипт пишет **user-level** хук:
+
+- `%USERPROFILE%\.cursor\hooks.json`
+- `%USERPROFILE%\.cursor\hooks\cursor_tts_hook.cmd`
+- `%USERPROFILE%\.cursor\hooks\tts_after_response.py`
+- `%USERPROFILE%\.cursor\hooks\tts_root.txt` ← путь к этому клону
+
+`hooks.json` в репо специально пустой: project-hooks + user-hooks = двойной вызов и поломки (`loop_limit: 0`).
+
+Не добавляй сюда `afterAgentResponse` / `stop` для TTS.

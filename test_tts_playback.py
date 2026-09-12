@@ -196,25 +196,5 @@ class TestPlaybackPause(unittest.TestCase):
         self.assertEqual(daemon._speech_queue.qsize(), 0)
 
 
-class TestPauseWhenIdle(unittest.TestCase):
-    def tearDown(self) -> None:
-        daemon.set_paused(False)
-        daemon.set_progress("idle", engine="local", current=0, total=0)
-
-    def test_pause_on_idle_is_noop_and_clears_flag(self) -> None:
-        daemon.set_progress("idle", engine="local", current=0, total=0)
-        daemon.set_paused(True)
-        self.assertTrue(daemon.is_paused())
-        ok = daemon.pause_playback()
-        self.assertFalse(ok)
-        self.assertFalse(daemon.is_paused())
-
-    def test_idle_progress_clears_pause(self) -> None:
-        daemon.set_progress("playing", engine="local", current=1, total=1)
-        daemon.set_paused(True)
-        daemon.set_progress("idle", engine="local", current=0, total=0)
-        self.assertFalse(daemon.is_paused())
-
-
 if __name__ == "__main__":
     unittest.main()

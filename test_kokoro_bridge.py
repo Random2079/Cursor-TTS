@@ -284,32 +284,8 @@ class ProgressStatusTests(unittest.TestCase):
         self.assertTrue(
             panel.preview_allowed({"warming": False, "phase": "idle"})
         )
-        self.assertFalse(
-            panel.preview_allowed({"warming": False, "phase": "playing"})
-        )
-        self.assertFalse(
-            panel.preview_allowed({"warming": False, "phase": "idle", "queue": 1})
-        )
-        self.assertFalse(
-            panel.preview_allowed(
-                {"warming": False, "phase": "synthesizing", "current": 1, "total": 3}
-            )
-        )
-
-    def test_engine_change_blocked_while_busy(self) -> None:
-        import TTS_Panel as panel
-
         self.assertTrue(
-            panel.engine_change_allowed({"warming": False, "phase": "idle"})
-        )
-        self.assertFalse(
-            panel.engine_change_allowed({"warming": True, "phase": "idle"})
-        )
-        self.assertFalse(
-            panel.engine_change_allowed({"warming": False, "phase": "playing"})
-        )
-        self.assertFalse(
-            panel.engine_change_allowed({"warming": False, "phase": "idle", "queue": 2})
+            panel.preview_allowed({"warming": False, "phase": "playing"})
         )
 
     def test_warmup_stale_after_limit(self) -> None:

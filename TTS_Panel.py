@@ -513,21 +513,9 @@ def daemon_busy(status: dict) -> bool:
     )
 
 
-def pause_actionable(status: dict) -> bool:
-    """Пауза имеет смысл только когда что-то играет / в очереди."""
-    return daemon_busy(status)
-
-
 def preview_allowed(status: dict) -> bool:
-    """Прослушать только когда демон не грузит модель и не озвучивает."""
-    if bool(status.get("warming")):
-        return False
-    return not daemon_busy(status)
-
-
-def engine_change_allowed(status: dict) -> bool:
-    """Смена движка = reboot демона — нельзя во время озвучки/прогрева."""
-    return not daemon_busy(status)
+    """Прослушать во время warmup сажает фразу в очередь — Stop её уже не снимает."""
+    return not bool(status.get("warming"))
 
 
 def warmup_is_stale(status: dict) -> bool:
@@ -580,12 +568,8 @@ def format_daemon_progress(status: dict) -> str:
             text = f"⏳ {engine}: загрузка модели · {elapsed} с"
             if total:
                 text += f" · затем кусок {current or 1} из {total}"
-    elif status.get("paused") and (
-        str(status.get("phase", "idle")).lower()
-        in {"preparing", "synthesizing", "playing"}
-        or queue_size
-    ):
-        text = f"⏸ {engine}: на паузе"
+    elif status.get("paused"):
+        text = f"⏸ {engine}: пауза · таймер стоп · {elapsed} с"
         if total:
             text += f" · кусок {chunk}"
     elif phase == "preparing":
@@ -617,10 +601,7 @@ def progress_bar_state(status: dict) -> tuple[int, int, bool, str]:
         if warmup_is_stale(status):
             return 0, 0, True, f"зависла {elapsed}с"
         return 0, 0, True, f"загрузка… {elapsed}с"
-    if status.get("paused") and (
-        phase in {"preparing", "synthesizing", "playing"}
-        or int(status.get("queue", 0) or 0) > 0
-    ):
+    if status.get("paused"):
         suffix = f"пауза {current}/{total}" if total else "пауза"
         return 0, 0, True, suffix
     if phase == "preparing":
@@ -638,8 +619,7 @@ class TTSPanel(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Cursor TTS")
-        self.resize(460, 400)
-        self.setMinimumWidth(440)
+        self.resize(420, 380)
         self._center()
         self._updating = False
         self._poll_busy = False
@@ -655,11 +635,9 @@ class TTSPanel(QMainWindow):
         layout.addWidget(self.auto_checkbox)
 
         self.interrupt_checkbox = QCheckBox(
-            "Обрывать старую озвучку новым ответом",
+            "Обрывать старую озвучку новым ответом "
+            "(выкл = очередь, быстрее; вкл = Stop mid-synth, возможен cold load)",
             self,
-        )
-        self.interrupt_checkbox.setToolTip(
-            "Выкл = очередь (быстрее). Вкл = Stop mid-synth, возможен cold load."
         )
         self.interrupt_checkbox.toggled.connect(self._on_interrupt_toggled)
         layout.addWidget(self.interrupt_checkbox)
@@ -738,11 +716,7 @@ class TTSPanel(QMainWindow):
         self.test_button = QPushButton("Прослушать", self)
         self.test_button.clicked.connect(self._on_test)
         self.test_button.setToolTip("Проверка голоса. Во время загрузки модели кнопка выключена.")
-        self.pause_button = QPushButton("⏸ Пауза", self)
-        self.pause_button.setToolTip(
-            "Заморозить звук на месте. Работает только во время озвучки. "
-            "Ctrl+Shift+P · Стоп сбрасывает всё."
-        )
+        self.pause_button = QPushButton("Пауза", self)
         self.pause_button.clicked.connect(self._on_pause_toggle)
         self.stop_button = QPushButton("Стоп", self)
         self.stop_button.clicked.connect(self._on_stop)
@@ -750,6 +724,10 @@ class TTSPanel(QMainWindow):
         buttons.addWidget(self.pause_button)
         buttons.addWidget(self.stop_button)
         layout.addLayout(buttons)
+
+        self.pause_state_label = QLabel("Состояние: ▶ играет / готово", self)
+        self.pause_state_label.setWordWrap(True)
+        layout.addWidget(self.pause_state_label)
 
         self.status_label = QLabel("", self)
         self.status_label.setWordWrap(True)
@@ -872,6 +850,8 @@ class TTSPanel(QMainWindow):
         engine = self.engine_combo.currentText()
         voice_label = self.voice_combo.currentText()
         volume = self.volume_slider.value()
+        paused = is_paused_flag()
+        pause_txt = "ПАУЗА" if paused else "играет"
         status = daemon_status()
         selected = str(self.engine_combo.currentData() or "").strip().lower()
         status_engine = str(status.get("engine", "")).strip().lower()
@@ -881,16 +861,11 @@ class TTSPanel(QMainWindow):
             status["engine"] = selected
             if status.get("warming"):
                 status["elapsed_sec"] = 0
-        paused = is_paused_flag()
-        if paused and not pause_actionable(status):
-            self._clear_stale_pause()
-            paused = False
         busy = daemon_busy(status)
         work = "занят" if busy else "готов"
-        pause_txt = " · пауза" if paused and pause_actionable(status) else ""
         self.status_label.setText(
             f"Авто: {auto} · {engine} · {voice_label} · "
-            f"{volume}% · демон {work}{pause_txt}"
+            f"{volume}% · демон {work} · {pause_txt}"
         )
         self.progress_label.setText(format_daemon_progress(status))
         value, maximum, indeterminate, title_suffix = progress_bar_state(status)
@@ -915,8 +890,7 @@ class TTSPanel(QMainWindow):
             self._poll_busy = busy
             self.timer.setInterval(400 if busy else 1000)
         self._apply_preview_enabled(status)
-        self._apply_engine_combo_enabled(status)
-        self._apply_pause_ui(paused, status)
+        self._apply_pause_ui(paused)
         if warmup_is_stale(status):
             if not self._stale_killed:
                 self._stale_killed = True
@@ -953,69 +927,28 @@ class TTSPanel(QMainWindow):
             self.test_button.setEnabled(allowed)
         if allowed:
             self.test_button.setToolTip("Проверка голоса текущим движком.")
-        elif status.get("warming") or self._preview_hold:
+        else:
             self.test_button.setToolTip(
                 "Модель ещё грузится — Прослушать выключено, иначе фраза зависает и Стоп молчит."
             )
-        elif daemon_busy(status):
-            self.test_button.setToolTip(
-                "Идёт озвучка — дождись конца или нажми Стоп, потом «Прослушать»."
-            )
-        else:
-            self.test_button.setToolTip("Прослушать временно недоступно.")
 
-    def _apply_engine_combo_enabled(self, status: dict) -> None:
-        allowed = engine_change_allowed(status)
-        if self.engine_combo.isEnabled() != allowed:
-            self.engine_combo.setEnabled(allowed)
-        if allowed:
-            self.engine_combo.setToolTip("Движок TTS. Смена перезапускает демон под новую модель.")
-        elif status.get("warming"):
-            self.engine_combo.setToolTip(
-                "Модель грузится — дождись «готов», потом меняй движок."
-            )
-        else:
-            self.engine_combo.setToolTip(
-                "Идёт озвучка — дождись конца или Стоп, потом меняй движок."
-            )
-
-    def _apply_pause_ui(self, paused: bool, status: dict | None = None) -> None:
-        status = status or {}
-        actionable = pause_actionable(status)
-        active = paused and actionable
-        self.pause_button.setEnabled(actionable or active)
-        if active:
-            self.pause_button.setText("▶ Продолжить")
+    def _apply_pause_ui(self, paused: bool) -> None:
+        if paused:
+            self.pause_button.setText("НА ПАУЗЕ — жми = продолжить")
             self.pause_button.setStyleSheet(
                 "background-color: #c0392b; color: white; font-weight: bold;"
             )
+            self.pause_state_label.setText(
+                "⏸ ПАУЗА: звук заморожен на месте (тот же слог). "
+                "Кнопка или Ctrl+Shift+P = продолжить. "
+                "Стоп (X) = сбросить всё."
+            )
+            self.pause_state_label.setStyleSheet("color: #c0392b; font-weight: bold;")
         else:
-            self.pause_button.setText("⏸ Пауза")
+            self.pause_button.setText("Пауза")
             self.pause_button.setStyleSheet("")
-            if not actionable:
-                self.pause_button.setToolTip(
-                    "Появится во время озвучки. Ctrl+Shift+P · Стоп сбрасывает всё."
-                )
-            else:
-                self.pause_button.setToolTip(
-                    "Заморозить звук на месте. Ctrl+Shift+P · Стоп сбрасывает всё."
-                )
-
-    def _clear_stale_pause(self) -> None:
-        """Файл TTS_PAUSED без живой озвучки — снять, иначе UI «висит» на паузе."""
-        PAUSE_FLAG.unlink(missing_ok=True)
-        if SPEAK_EDGE.is_file():
-            flags = 0x08000000 if sys.platform == "win32" else 0
-            try:
-                subprocess.run(
-                    [sys.executable, str(SPEAK_EDGE), "--resume"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=flags,
-                    timeout=3,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+            self.pause_state_label.setText("Состояние: ▶ играет / готово")
+            self.pause_state_label.setStyleSheet("")
 
     def _on_auto_toggled(self, checked: bool) -> None:
         if self._updating:
@@ -1046,24 +979,6 @@ class TTSPanel(QMainWindow):
         if self._updating:
             return
         engine = str(self.engine_combo.currentData() or DEFAULT_ENGINE)
-        status = daemon_status()
-        if not engine_change_allowed(status):
-            prev = str(load_config().get("engine", DEFAULT_ENGINE))
-            self._updating = True
-            prev_index = self.engine_combo.findData(prev)
-            if prev_index >= 0:
-                self.engine_combo.setCurrentIndex(prev_index)
-            self._updating = False
-            if status.get("warming"):
-                self.status_label.setText(
-                    "Модель ещё грузится — смена движка сбросит прогрев. Дождись «готов»."
-                )
-            else:
-                self.status_label.setText(
-                    "Идёт озвучка — смена движка оборвёт текст и перезапустит демон. "
-                    "Дождись конца или нажми Стоп."
-                )
-            return
         cfg = load_config()
         selected = self._selected_voice_for_engine(cfg, engine)
         self._fill_voices(engine, selected)
@@ -1209,12 +1124,6 @@ class TTSPanel(QMainWindow):
             )
             self.test_button.setEnabled(False)
             return
-        if daemon_busy(status):
-            self.status_label.setText(
-                "Идёт озвучка ответа — «Прослушать» оборвёт её. "
-                "Дождись конца или нажми Стоп."
-            )
-            return
         if not preview_allowed(status):
             self.status_label.setText(
                 "Подожди загрузку модели. Прослушать сейчас не жми — Стоп потом не спасёт."
@@ -1225,6 +1134,7 @@ class TTSPanel(QMainWindow):
             self.status_label.setText("Ошибка: не найден speak_edge.py")
             return
 
+        stop_speech()
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", suffix=".txt", delete=False
         ) as tmp:
@@ -1260,23 +1170,17 @@ class TTSPanel(QMainWindow):
         self.status_label.setText(tip)
 
     def _on_pause_toggle(self) -> None:
-        status = daemon_status()
-        if not pause_actionable(status) and not is_paused_flag():
-            self.status_label.setText("Пауза доступна только во время озвучки.")
-            self._apply_pause_ui(False, status)
-            return
         paused = pause_toggle_speech()
-        status = daemon_status()
-        self._apply_pause_ui(paused, status)
+        self._apply_pause_ui(paused)
         if paused:
-            self.status_label.setText("⏸ На паузе — жми «Продолжить» или Ctrl+Shift+P.")
+            self.status_label.setText("⏸ Сейчас НА ПАУЗЕ. Ещё раз Пауза / Ctrl+Shift+P = продолжить.")
         else:
-            self.status_label.setText("▶ Продолжаю озвучку.")
+            self.status_label.setText("▶ Снял паузу — играет / готово.")
 
     def _on_stop(self) -> None:
         stop_speech()
         # стоп снимает паузу в демоне
-        self._apply_pause_ui(False, daemon_status())
+        self._apply_pause_ui(False)
         self.status_label.setText("Остановлено (очередь сброшена, пауза снята).")
 
     def closeEvent(self, event) -> None:  # noqa: N802

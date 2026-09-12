@@ -162,9 +162,6 @@ def set_progress(
             _progress["phase_started"] = time.monotonic()
             _progress["paused_accum"] = 0.0
             _progress["pause_mark"] = 0.0
-    if phase == "idle":
-        # Иначе pause_mark сброшен, а _paused=True → elapsed тикает в UI на пустом месте.
-        set_paused(False)
 
 
 def set_warmup_active(value: bool, *, engine: str | None = None) -> int:
@@ -537,34 +534,8 @@ def _normalize_local_speaker(speaker: str | None) -> str:
     return v if v in known else silero_default
 
 
-def playback_pausable() -> bool:
-    """Пауза имеет смысл только пока идёт озвучка / синтез / очередь."""
-    with _progress_lock:
-        phase = str(_progress.get("phase", "idle")).strip().lower()
-        warming = _warmup_active
-    if warming:
-        return False
-    if phase in {"preparing", "synthesizing", "playing"}:
-        return True
-    if _speech_queue.qsize() > 0:
-        return True
-    if _mixer_ready:
-        try:
-            import pygame
-
-            if pygame.mixer.music.get_busy():
-                return True
-        except Exception:
-            pass
-    return False
-
-
-def pause_playback() -> bool:
+def pause_playback() -> None:
     """Pause: pygame pause(), очередь и текущий кусок не сбрасывать."""
-    if not playback_pausable():
-        if is_paused():
-            set_paused(False)
-        return False
     set_paused(True)
     try:
         import pygame
@@ -573,7 +544,6 @@ def pause_playback() -> bool:
             pygame.mixer.music.pause()
     except Exception:
         pass
-    return True
 
 
 def resume_playback() -> None:
@@ -1232,14 +1202,9 @@ def handle_client(conn: socket.socket) -> None:
                 end_warmup(token)
             return
         if cmd == "pause":
-            paused = pause_playback()
-            debug_log(f"PAUSE ok={paused}")
-            conn.sendall(
-                (
-                    json.dumps({"ok": True, "paused": paused}, ensure_ascii=False)
-                    + "\n"
-                ).encode("utf-8")
-            )
+            pause_playback()
+            debug_log("PAUSE")
+            conn.sendall(b'{"ok":true,"paused":true}\n')
             return
         if cmd == "resume":
             resume_playback()
@@ -1252,14 +1217,9 @@ def handle_client(conn: socket.socket) -> None:
                 debug_log("PAUSE_TOGGLE -> resume")
                 conn.sendall(b'{"ok":true,"paused":false}\n')
             else:
-                paused = pause_playback()
-                debug_log(f"PAUSE_TOGGLE -> pause ok={paused}")
-                conn.sendall(
-                    (
-                        json.dumps({"ok": True, "paused": paused}, ensure_ascii=False)
-                        + "\n"
-                    ).encode("utf-8")
-                )
+                pause_playback()
+                debug_log("PAUSE_TOGGLE -> pause")
+                conn.sendall(b'{"ok":true,"paused":true}\n')
             return
         if cmd == "stop":
             cleared = clear_speech_queue()

@@ -59,14 +59,13 @@ def claim_generation(generation_id: str, conversation_id: str = "") -> bool:
         return True
 
 
-def read_hook_payload() -> dict:
+def read_hook_payload(raw: str) -> dict:
     if hasattr(sys.stdin, "reconfigure"):
         try:
             sys.stdin.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
 
-    raw = sys.stdin.read()
     log(f"stdin chars={len(raw)} preview={raw[:120]!r}")
 
     if not raw.strip():
@@ -177,11 +176,32 @@ def main() -> int:
 
     from speak_edge import daemon_alive, panel_active
 
+    if hasattr(sys.stdin, "reconfigure"):
+        try:
+            sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    raw_stdin = sys.stdin.read()
+
+    if not raw_stdin.strip():
+        log("stdin empty — stop/no-op")
+        if daemon_alive():
+            try:
+                from speak_edge import send_command
+
+                send_command({"cmd": "stop"}, timeout=2.0)
+                log("hook empty stdin -> daemon stop")
+            except Exception as error:
+                log(f"hook empty stdin stop failed: {type(error).__name__}: {error}")
+        return 0
+
     if OFF_FLAG.exists():
         log("TTS disabled by TTS_OFF")
         return 0
 
-    if not panel_active():
+    panel_ok = panel_active()
+
+    if not panel_ok:
         log("TTS panel not running — skip hook")
         if daemon_alive():
             try:
@@ -194,7 +214,7 @@ def main() -> int:
         return 0
 
     try:
-        data = read_hook_payload()
+        data = read_hook_payload(raw_stdin)
     except Exception as error:
         log(f"Payload failed: {type(error).__name__}: {error}")
         return 0
@@ -205,6 +225,10 @@ def main() -> int:
     gen = str(data.get("generation_id") or "")
 
     if event == "stop":
+        # Cursor шлёт stop+completed сразу после afterAgentResponse — это не «Стоп» пользователя.
+        if status.strip().lower() == "completed":
+            log(f"hook stop ignored (status={status}) — keep TTS playback")
+            return 0
         try:
             from speak_edge import send_command
 

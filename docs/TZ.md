@@ -122,7 +122,7 @@ python -m unittest test_tts_playback.py test_text_prep.py -v
 ## Проверка (команды)
 
 ```powershell
-cd path\to\Cursor-TTS
+cd C:\Users\Home\OneDrive\Desktop\DS_Projects\Cursor_TTS
 python -m unittest discover -s . -p "test_*.py" -v
 python TTS_Panel.py
 ```
@@ -133,7 +133,7 @@ python TTS_Panel.py
 
 | Part | Код |
 |------|-----|
-| Hook | `.cursor/hooks/tts_after_response.py`, `~/.cursor/hooks.json` (см. `scripts/install_cursor_hook.ps1`) |
+| Hook | `DS_Projects/.cursor/hooks/tts_after_response.py`, `~/.cursor/hooks.json` |
 | Клиент | `speak_edge.py` |
 | Демон | `tts_daemon.py` |
 | Tera | `speak_tera.py` |

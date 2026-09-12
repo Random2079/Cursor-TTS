@@ -39,3 +39,7 @@ Desktop.ini
 
 tts_daemon.pid
 
+
+_qwen_probe*.wav
+_qwen_official_probe.wav
+

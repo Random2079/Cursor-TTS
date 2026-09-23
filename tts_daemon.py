@@ -45,7 +45,7 @@ DEFAULT_QWEN_SPEAKER = "serena"
 DEFAULT_QWEN_DESIGN = "micro_wife/voice_design.txt"
 _ENGINES = {"local", "edge", "tera", "qwen", "openai"}
 _DEAD_ENGINES = {"kokoro", "piper"}  # kokoro→edge, piper→local
-_HYBRID_MODES = {"off", "dict_only", "dict_and_en"}
+_HYBRID_MODES = {"off", "dict_only"}
 # Живой Qwen на 3050: 20–30с / до ~160с если тесно. Дальше CUDA стоит — процесс надо убить.
 WARMUP_STALE_SEC = 240
 WARMUP_BUSY_OTHER = -1
@@ -328,6 +328,9 @@ def load_config() -> dict:
             except Exception:
                 data["tera_duration_scale"] = DEFAULT_TERA_DURATION_SCALE
             hybrid = str(raw.get("hybrid_mode", DEFAULT_HYBRID_MODE)).strip().lower()
+            # EN-теги Tera меняют тембр и дают фризы — только словарь под RU-голос.
+            if hybrid == "dict_and_en":
+                hybrid = "dict_only"
             data["hybrid_mode"] = hybrid if hybrid in _HYBRID_MODES else DEFAULT_HYBRID_MODE
             data["qwen_model"] = (
                 str(raw.get("qwen_model", DEFAULT_QWEN_MODEL)).strip() or DEFAULT_QWEN_MODEL
@@ -923,42 +926,27 @@ def _parts_for_engine(text: str, engine: str) -> list[str]:
 
 
 def _effective_hybrid(cfg: dict) -> str:
-    """dict_and_en только у Tera (нативные <en>/<ru>). Иначе → dict_only."""
+    """Только off / dict_only. Смена голоса через <en> отключена."""
     mode = str(cfg.get("hybrid_mode", DEFAULT_HYBRID_MODE)).strip().lower()
+    if mode == "dict_and_en":
+        mode = "dict_only"
     if mode not in _HYBRID_MODES:
         mode = DEFAULT_HYBRID_MODE
-    if mode == "off":
-        return "off"
-    if mode == "dict_and_en":
-        engine = str(cfg.get("engine", DEFAULT_ENGINE)).strip().lower()
-        if engine == "tera":
-            return "dict_and_en"
-        return "dict_only"
-    return "dict_only"
+    return "off" if mode == "off" else "dict_only"
 
 
 def _speech_units(text: str, cfg: dict) -> list[tuple[str, str]]:
-    """Куски [(текст, lang)]. dict_and_en+Tera → RU/EN сегменты; иначе всё ru."""
+    """Куски [(текст, lang)]. Всегда ru: один голос Tera, EN через словарь."""
     hybrid = _effective_hybrid(cfg)
     engine = str(cfg.get("engine", DEFAULT_ENGINE))
+    prepared = text
     try:
-        if hybrid == "dict_and_en":
-            from text_prep import finalize_speech_segments
-
-            units: list[tuple[str, str]] = []
-            for seg in finalize_speech_segments(text):
-                for chunk in _parts_for_engine(seg.text, engine):
-                    if chunk:
-                        units.append((chunk, seg.lang))
-            return units
-
         from text_prep import finalize_speech_text
 
         prepared = finalize_speech_text(text, apply_dict=hybrid != "off")
-        return [(chunk, "ru") for chunk in _parts_for_engine(prepared, engine) if chunk]
     except Exception as error:
         debug_log(f"text_prep skipped: {error}")
-        return [(chunk, "ru") for chunk in _parts_for_engine(text, engine) if chunk]
+    return [(chunk, "ru") for chunk in _parts_for_engine(prepared, engine) if chunk]
 
 
 def speak_text(item: SpeechItem) -> None:

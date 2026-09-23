@@ -140,8 +140,15 @@ class TestPathAndChunkPrep(unittest.TestCase):
         self.assertFalse(any(t.strip().lower().startswith("мд") for t, _ in units))
 
 
-class TestTeraEnHybrid(unittest.TestCase):
-    def test_dict_and_en_routes_english(self) -> None:
+class TestRuOnlyHybrid(unittest.TestCase):
+    def test_dict_and_en_collapses_to_dict_only(self) -> None:
+        import tts_daemon as daemon
+
+        for engine in ("tera", "edge", "local"):
+            cfg = {"engine": engine, "hybrid_mode": "dict_and_en"}
+            self.assertEqual(daemon._effective_hybrid(cfg), "dict_only")
+
+    def test_english_phrase_stays_ru_units(self) -> None:
         import tts_daemon as daemon
 
         source = "Check the network connection and restart."
@@ -150,14 +157,10 @@ class TestTeraEnHybrid(unittest.TestCase):
                 source, {"engine": "tera", "hybrid_mode": "dict_and_en"}
             )
         self.assertTrue(units)
-        self.assertTrue(any(lang == "en" for _, lang in units))
-        self.assertIn("network", " ".join(t for t, lang in units if lang == "en").lower())
-
-    def test_dict_and_en_falls_back_on_edge(self) -> None:
-        import tts_daemon as daemon
-
-        cfg = {"engine": "edge", "hybrid_mode": "dict_and_en"}
-        self.assertEqual(daemon._effective_hybrid(cfg), "dict_only")
+        self.assertTrue(all(lang == "ru" for _, lang in units))
+        joined = " ".join(t for t, _ in units).lower()
+        self.assertIn("нэтворк", joined)
+        self.assertIn("рестарт", joined)
 
 
 class TestMissingEnModel(unittest.TestCase):

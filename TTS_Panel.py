@@ -513,6 +513,16 @@ def daemon_busy(status: dict) -> bool:
     )
 
 
+def speech_in_progress(status: dict) -> bool:
+    """Озвучка/очередь — темп Tera mid-speech нельзя."""
+    if not status:
+        return False
+    phase = str(status.get("phase", "idle")).strip().lower()
+    return phase in {"preparing", "synthesizing", "playing"} or int(
+        status.get("queue", 0) or 0
+    ) > 0
+
+
 def preview_allowed(status: dict) -> bool:
     """Прослушать во время warmup сажает фразу в очередь — Stop её уже не снимает."""
     return not bool(status.get("warming"))
@@ -891,6 +901,7 @@ class TTSPanel(QMainWindow):
             self.timer.setInterval(400 if busy else 1000)
         self._apply_preview_enabled(status)
         self._apply_pause_ui(paused)
+        self._apply_tempo_lock(status)
         if warmup_is_stale(status):
             if not self._stale_killed:
                 self._stale_killed = True
@@ -930,6 +941,27 @@ class TTSPanel(QMainWindow):
         else:
             self.test_button.setToolTip(
                 "Модель ещё грузится — Прослушать выключено, иначе фраза зависает и Стоп молчит."
+            )
+
+    def _apply_tempo_lock(self, status: dict) -> None:
+        """Темп запекается в wav — во время озвучки слайдер выключен."""
+        engine = str(self.engine_combo.currentData() or "").strip().lower()
+        if engine != "tera":
+            if self.tera_tempo_slider.isEnabled():
+                self.tera_tempo_slider.setEnabled(False)
+            self.tera_tempo_slider.setToolTip("Темп только для движка Tera.")
+            return
+        locked = speech_in_progress(status)
+        want = not locked
+        if self.tera_tempo_slider.isEnabled() != want:
+            self.tera_tempo_slider.setEnabled(want)
+        if locked:
+            self.tera_tempo_slider.setToolTip(
+                "Темп нельзя менять во время озвучки — Стоп или дождись конца, потом крути."
+            )
+        else:
+            self.tera_tempo_slider.setToolTip(
+                "duration_scale Tera: меньше = быстрее речь, больше = медленнее. 100 = норма."
             )
 
     def _apply_pause_ui(self, paused: bool) -> None:
@@ -1014,7 +1046,9 @@ class TTSPanel(QMainWindow):
         else:
             msg = f"{msg_prefix}Движок: {engine}."
         self.status_label.setText(msg)
-        self.tera_tempo_slider.setEnabled(engine == "tera")
+        # Tempo lock подтянет _refresh_status; здесь только engine!=tera.
+        if engine != "tera":
+            self.tera_tempo_slider.setEnabled(False)
         try:
             if str(ROOT) not in sys.path:
                 sys.path.insert(0, str(ROOT))
@@ -1087,6 +1121,9 @@ class TTSPanel(QMainWindow):
             self.tera_tempo_slider.blockSignals(False)
         self._set_tera_tempo_label(value)
         if self._updating:
+            return
+        if speech_in_progress(daemon_status()):
+            # На всякий: слайдер мог успеть дернуться до lock.
             return
         save_config(tera_duration_scale=value / 100.0)
         self._refresh_status()

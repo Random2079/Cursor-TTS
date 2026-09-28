@@ -765,6 +765,7 @@ def split_for_speech(text: str) -> list[str]:
 def play_file(mp3_path: Path, volume: float) -> bool:
     """Играть до конца. True = дослушали, False = hard stop.
     get_busy() на паузе False — не считать это концом файла.
+    Громкость подтягивается из tts_config.json на лету (слайдер панели).
     """
     import pygame
 
@@ -776,10 +777,17 @@ def play_file(mp3_path: Path, volume: float) -> bool:
     if is_paused() and not wait_while_paused():
         return False
     try:
+        live_vol = float(volume)
+        try:
+            live_vol = float(load_config().get("volume", live_vol))
+        except Exception:
+            pass
         pygame.mixer.music.load(str(mp3_path))
-        pygame.mixer.music.set_volume(volume)
+        pygame.mixer.music.set_volume(live_vol)
         pygame.mixer.music.play()
         mixer_paused = False
+        last_vol = live_vol
+        vol_check_at = 0.0
         while True:
             if _stop_event.is_set():
                 pygame.mixer.music.stop()
@@ -793,6 +801,16 @@ def play_file(mp3_path: Path, volume: float) -> bool:
             if mixer_paused:
                 pygame.mixer.music.unpause()
                 mixer_paused = False
+            now = time.monotonic()
+            if now >= vol_check_at:
+                vol_check_at = now + 0.12
+                try:
+                    fresh = float(load_config().get("volume", last_vol))
+                except Exception:
+                    fresh = last_vol
+                if abs(fresh - last_vol) > 0.005:
+                    last_vol = fresh
+                    pygame.mixer.music.set_volume(last_vol)
             if pygame.mixer.music.get_busy():
                 pygame.time.wait(40)
                 continue
@@ -948,7 +966,9 @@ def _effective_hybrid(cfg: dict) -> str:
         mode = "dict_only"
     if mode not in _HYBRID_MODES:
         mode = DEFAULT_HYBRID_MODE
-    return "off" if mode == "off" else "dict_only"
+    if mode == "off":
+        return "off"
+    return "dict_only"
 
 
 def _speech_units(text: str, cfg: dict) -> list[tuple[str, str]]:
@@ -1151,6 +1171,10 @@ def speak_text(item: SpeechItem) -> None:
                 index += 1
                 if index >= len(units):
                     break
+                try:
+                    pause_ms = int(load_config().get("pause_ms", pause_ms))
+                except Exception:
+                    pass
                 pause_after_chunk(part, pause_ms)
                 if units[index][1] != lang and switch_ms > 0:
                     end_at = time.monotonic() + switch_ms / 1000.0

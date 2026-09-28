@@ -170,6 +170,44 @@ class TestListChunking(unittest.TestCase):
         self.assertNotIn("пяти, восемь", low)
 
 
+class TestReadingProfiles(unittest.TestCase):
+    def test_manual_keeps_slider_values(self) -> None:
+        import tts_daemon as daemon
+
+        cfg = {
+            "reading_profile": "manual",
+            "pause_ms": 777,
+            "tera_duration_scale": 1.11,
+        }
+        eff = daemon.effective_speak_settings(cfg)
+        self.assertEqual(eff["reading_profile"], "manual")
+        self.assertEqual(eff["pause_ms"], 777)
+        self.assertIsNone(eff["chunk_target"])
+
+    def test_profile_a_overrides_chunk(self) -> None:
+        import tts_daemon as daemon
+
+        cfg = {
+            "reading_profile": "a",
+            "pause_ms": 10,
+            "tera_duration_scale": 1.0,
+        }
+        eff = daemon.effective_speak_settings(cfg)
+        self.assertEqual(eff["reading_profile"], "a")
+        self.assertEqual(eff["pause_ms"], 550)
+        self.assertEqual(eff["chunk_target"], 300)
+        self.assertAlmostEqual(float(eff["tera_duration_scale"]), 1.25)
+
+    def test_rollback_exists(self) -> None:
+        import tts_daemon as daemon
+
+        eff = daemon.effective_speak_settings(
+            {"reading_profile": "rollback", "pause_ms": 1, "tera_duration_scale": 1.0}
+        )
+        self.assertEqual(eff["reading_profile"], "rollback")
+        self.assertEqual(eff["chunk_target"], 520)
+
+
 class TestRuOnlyHybrid(unittest.TestCase):
     def test_dict_and_en_collapses_to_dict_only(self) -> None:
         import tts_daemon as daemon

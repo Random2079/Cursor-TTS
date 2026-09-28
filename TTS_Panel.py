@@ -49,6 +49,7 @@ VOICES_LOCAL = [
 ]
 DEFAULT_LOCAL_SPEAKER = "xenia"
 DEFAULT_HYBRID_MODE = "dict_only"
+DEFAULT_READING_PROFILE = "manual"
 DEFAULT_VOLUME = 45
 DEFAULT_ENGINE = "tera"
 DEFAULT_PAUSE_MS = 350
@@ -61,6 +62,8 @@ DEFAULT_TERA_DURATION_SCALE = 1.0
 _ENGINES = {"local", "edge", "tera", "qwen", "openai"}
 _DEAD_ENGINES = {"kokoro", "piper"}
 _HYBRID_MODES = {"off", "dict_only"}
+_MANUAL_PROFILES = frozenset({"manual", "off", ""})
+PROFILES_FILE = ROOT / "reading_profiles.json"
 HYBRID_ITEMS = [
     ("off", "Как написано (без словаря)"),
     ("dict_only", "Словарь IT (один RU-голос)"),
@@ -103,6 +106,7 @@ def load_config() -> dict:
         "tera_voice": DEFAULT_TERA_VOICE,
         "tera_duration_scale": DEFAULT_TERA_DURATION_SCALE,
         "hybrid_mode": DEFAULT_HYBRID_MODE,
+        "reading_profile": DEFAULT_READING_PROFILE,
         "micro_wife_design_file": DEFAULT_QWEN_DESIGN,
         "qwen_speaker": DEFAULT_QWEN_SPEAKER,
         "volume": DEFAULT_VOLUME,
@@ -160,6 +164,9 @@ def load_config() -> dict:
         hybrid = "dict_only"
     data["hybrid_mode"] = hybrid if hybrid in _HYBRID_MODES else DEFAULT_HYBRID_MODE
 
+    profile = str(data.get("reading_profile", DEFAULT_READING_PROFILE)).strip().lower()
+    data["reading_profile"] = profile or DEFAULT_READING_PROFILE
+
     design = str(data.get("micro_wife_design_file", DEFAULT_QWEN_DESIGN)).strip()
     known_qwen = {code for code, _ in VOICES_QWEN}
     if design not in known_qwen:
@@ -191,6 +198,7 @@ def save_config(
     tera_voice: str | None = None,
     tera_duration_scale: float | None = None,
     hybrid_mode: str | None = None,
+    reading_profile: str | None = None,
     micro_wife_design_file: str | None = None,
     qwen_speaker: str | None = None,
     volume: int | None = None,
@@ -227,6 +235,10 @@ def save_config(
         if mode == "dict_and_en":
             mode = "dict_only"
         data["hybrid_mode"] = mode if mode in _HYBRID_MODES else DEFAULT_HYBRID_MODE
+    if reading_profile is not None:
+        data["reading_profile"] = (
+            str(reading_profile).strip().lower() or DEFAULT_READING_PROFILE
+        )
     if micro_wife_design_file is not None:
         data["micro_wife_design_file"] = micro_wife_design_file
         # держим active voice_design.txt в синхроне с пресетом
@@ -523,6 +535,39 @@ def speech_in_progress(status: dict) -> bool:
     ) > 0
 
 
+def load_reading_profile_items() -> list[tuple[str, str]]:
+    """[(code, label)] для комбо: manual + rollback/A–D из файла."""
+    items = [("manual", "Ручной (слайдеры)")]
+    try:
+        raw = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return items
+    if not isinstance(raw, dict):
+        return items
+    # rollback первым после manual
+    order = ["rollback", "a", "b", "c", "d"]
+    seen: set[str] = set()
+    for key in order:
+        for raw_key, value in raw.items():
+            code = str(raw_key).strip().lower()
+            if code != key or code.startswith("_") or not isinstance(value, dict):
+                continue
+            label = str(value.get("label") or code)
+            items.append((code, label))
+            seen.add(code)
+    for raw_key, value in raw.items():
+        code = str(raw_key).strip().lower()
+        if (
+            not code
+            or code.startswith("_")
+            or code in seen
+            or not isinstance(value, dict)
+        ):
+            continue
+        items.append((code, str(value.get("label") or code)))
+    return items
+
+
 def preview_allowed(status: dict) -> bool:
     """Прослушать во время warmup сажает фразу в очередь — Stop её уже не снимает."""
     return not bool(status.get("warming"))
@@ -679,6 +724,18 @@ class TTSPanel(QMainWindow):
         self.hybrid_combo.currentIndexChanged.connect(self._on_hybrid_changed)
         hybrid_row.addWidget(self.hybrid_combo, stretch=1)
         layout.addLayout(hybrid_row)
+
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Чтение:", self))
+        self.profile_combo = QComboBox(self)
+        for code, label in load_reading_profile_items():
+            self.profile_combo.addItem(label, code)
+        self.profile_combo.setToolTip(
+            "Пресет темпа/паузы/куска. «Откат» — точка до подбора. Ручной — слайдеры."
+        )
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
+        profile_row.addWidget(self.profile_combo, stretch=1)
+        layout.addLayout(profile_row)
 
         volume_row = QHBoxLayout()
         volume_row.addWidget(QLabel("Громкость:", self))
@@ -844,7 +901,14 @@ class TTSPanel(QMainWindow):
         )
         if hybrid_index >= 0:
             self.hybrid_combo.setCurrentIndex(hybrid_index)
+        profile = str(cfg.get("reading_profile", DEFAULT_READING_PROFILE)).strip().lower()
+        profile_index = self.profile_combo.findData(profile)
+        if profile_index < 0:
+            profile_index = self.profile_combo.findData(DEFAULT_READING_PROFILE)
+        if profile_index >= 0:
+            self.profile_combo.setCurrentIndex(profile_index)
         self._updating = False
+        self._apply_profile_controls(profile)
 
     def _poll_disk(self) -> None:
         # AHK мог включить/выключить авто — подтягиваем галочку.
@@ -902,6 +966,10 @@ class TTSPanel(QMainWindow):
         self._apply_preview_enabled(status)
         self._apply_pause_ui(paused)
         self._apply_tempo_lock(status)
+        profile = str(
+            self.profile_combo.currentData() or DEFAULT_READING_PROFILE
+        ).strip().lower()
+        self._apply_profile_controls(profile)
         if warmup_is_stale(status):
             if not self._stale_killed:
                 self._stale_killed = True
@@ -946,10 +1014,11 @@ class TTSPanel(QMainWindow):
     def _apply_tempo_lock(self, status: dict) -> None:
         """Темп запекается в wav — во время озвучки слайдер выключен."""
         engine = str(self.engine_combo.currentData() or "").strip().lower()
-        if engine != "tera":
-            if self.tera_tempo_slider.isEnabled():
-                self.tera_tempo_slider.setEnabled(False)
-            self.tera_tempo_slider.setToolTip("Темп только для движка Tera.")
+        profile = str(
+            self.profile_combo.currentData() or DEFAULT_READING_PROFILE
+        ).strip().lower()
+        if engine != "tera" or profile not in _MANUAL_PROFILES:
+            # Не-tera или пресет — темп не из слайдера (см. _apply_profile_controls).
             return
         locked = speech_in_progress(status)
         want = not locked
@@ -963,6 +1032,61 @@ class TTSPanel(QMainWindow):
             self.tera_tempo_slider.setToolTip(
                 "duration_scale Tera: меньше = быстрее речь, больше = медленнее. 100 = норма."
             )
+
+    def _apply_profile_controls(self, profile: str) -> None:
+        """Пресет держит темп/паузу; ручной — слайдеры (темп ещё и speech-lock)."""
+        manual = profile in _MANUAL_PROFILES
+        engine = str(self.engine_combo.currentData() or "").strip().lower()
+        if manual:
+            self.pause_slider.setEnabled(True)
+            self.pause_slider.setToolTip("Пауза между кусками (live).")
+            if engine == "tera" and not speech_in_progress(daemon_status()):
+                self.tera_tempo_slider.setEnabled(True)
+                self.tera_tempo_slider.setToolTip(
+                    "duration_scale Tera: меньше = быстрее речь, больше = медленнее. 100 = норма."
+                )
+            elif engine != "tera":
+                self.tera_tempo_slider.setEnabled(False)
+                self.tera_tempo_slider.setToolTip("Темп только для движка Tera.")
+            return
+        self.pause_slider.setEnabled(False)
+        self.pause_slider.setToolTip("Пауза из пресета «Чтение». Ручной — чтобы крутить слайдер.")
+        self.tera_tempo_slider.setEnabled(False)
+        self.tera_tempo_slider.setToolTip(
+            "Темп из пресета «Чтение». Ручной или Откат+правки слайдерами — после выбора Ручной."
+        )
+
+    def _on_profile_changed(self, _index: int) -> None:
+        if self._updating:
+            return
+        code = str(self.profile_combo.currentData() or DEFAULT_READING_PROFILE).strip().lower()
+        save_config(reading_profile=code)
+        self._apply_profile_controls(code)
+        # Показать числа пресета на слайдерах (без записи в manual-поля, кроме отображения).
+        if code not in _MANUAL_PROFILES:
+            try:
+                raw = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
+                prof = None
+                if isinstance(raw, dict):
+                    for key, value in raw.items():
+                        if str(key).strip().lower() == code and isinstance(value, dict):
+                            prof = value
+                            break
+                if isinstance(prof, dict):
+                    self._updating = True
+                    if "pause_ms" in prof:
+                        pause = int(prof["pause_ms"])
+                        self.pause_slider.setValue(pause)
+                        self.pause_label.setText(f"{pause} ms")
+                    if "tera_duration_scale" in prof:
+                        scale = float(prof["tera_duration_scale"])
+                        tempo_pct = int(round(scale * 100))
+                        self.tera_tempo_slider.setValue(max(60, min(150, tempo_pct)))
+                        self._set_tera_tempo_label(tempo_pct)
+                    self._updating = False
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                self._updating = False
+        self._refresh_status()
 
     def _apply_pause_ui(self, paused: bool) -> None:
         if paused:

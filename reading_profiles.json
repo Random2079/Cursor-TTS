@@ -7,10 +7,10 @@
     "chunk_target": 520
   },
   "A": {
-    "label": "A · спокойный",
-    "tera_duration_scale": 1.25,
-    "pause_ms": 550,
-    "chunk_target": 300
+    "label": "A · спокойный (чуть быстрее)",
+    "tera_duration_scale": 1.18,
+    "pause_ms": 480,
+    "chunk_target": 320
   },
   "B": {
     "label": "B · ещё спокойнее",

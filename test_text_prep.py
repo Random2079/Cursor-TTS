@@ -194,9 +194,9 @@ class TestReadingProfiles(unittest.TestCase):
         }
         eff = daemon.effective_speak_settings(cfg)
         self.assertEqual(eff["reading_profile"], "a")
-        self.assertEqual(eff["pause_ms"], 550)
-        self.assertEqual(eff["chunk_target"], 300)
-        self.assertAlmostEqual(float(eff["tera_duration_scale"]), 1.25)
+        self.assertEqual(eff["pause_ms"], 480)
+        self.assertEqual(eff["chunk_target"], 320)
+        self.assertAlmostEqual(float(eff["tera_duration_scale"]), 1.18)
 
     def test_rollback_exists(self) -> None:
         import tts_daemon as daemon

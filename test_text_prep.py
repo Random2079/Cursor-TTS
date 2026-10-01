@@ -170,6 +170,22 @@ class TestListChunking(unittest.TestCase):
         self.assertNotIn("пяти, восемь", low)
 
 
+class TestPercentAndMoney(unittest.TestCase):
+    def test_percent_spoken(self) -> None:
+        out = finalize_speech_text(
+            "5 дней, 21% Auto / 19% себя. Жечь оставшиеся %.",
+            apply_dict=True,
+        ).lower()
+        self.assertIn("процент", out)
+        self.assertNotIn("%", out)
+        self.assertIn("авто", out)
+
+    def test_dollar_spoken(self) -> None:
+        out = finalize_speech_text("при $60 уже заплатил", apply_dict=False).lower()
+        self.assertIn("доллар", out)
+        self.assertNotIn("$", out)
+
+
 class TestReadingProfiles(unittest.TestCase):
     def test_manual_keeps_slider_values(self) -> None:
         import tts_daemon as daemon

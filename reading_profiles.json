@@ -1,10 +1,10 @@
 {
-  "_comment": "Пресеты чтения. manual = слайдеры панели. rollback = точка до подбора пресетов (крупный кусок).",
+  "_comment": "Пресеты чтения. manual = слайдеры. rollback = снимок «голос ок» 2026-10-02 (config_backups/2026-10-02_heard_ok).",
   "rollback": {
-    "label": "Откат (до пресетов)",
-    "tera_duration_scale": 1.2,
-    "pause_ms": 500,
-    "chunk_target": 520
+    "label": "Откат · голос ок 2026-10-02",
+    "tera_duration_scale": 1.18,
+    "pause_ms": 480,
+    "chunk_target": 320
   },
   "A": {
     "label": "A · спокойный (чуть быстрее)",
@@ -25,9 +25,9 @@
     "chunk_target": 340
   },
   "D": {
-    "label": "D · плотнее",
+    "label": "D · плотнее / меньше дыр",
     "tera_duration_scale": 1.15,
-    "pause_ms": 350,
-    "chunk_target": 400
+    "pause_ms": 280,
+    "chunk_target": 420
   }
 }

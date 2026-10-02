@@ -433,20 +433,26 @@ def wait_while_paused() -> bool:
 
 
 def pause_after_chunk(part: str, base_ms: int) -> None:
-    """Пауза между кусками: дольше после .!? , короче после запятой, 0 если стоп/pause."""
+    """Пауза между кусками: дольше после .!? , короче после запятой, 0 если стоп/pause.
+
+    При base_ms ≤ 160 (следующий кусок уже prefetch) не раздуваем ×1.4 —
+    иначе слышны искусственные дыры даже когда аудио готово.
+    """
     if base_ms <= 0 or _stop_event.is_set() or is_paused():
         return
     stripped = part.rstrip()
     if not stripped:
         return
     end = stripped[-1]
-    if end in ".!?…":
+    if base_ms <= 160:
+        delay = base_ms
+    elif end in ".!?…":
         delay = int(base_ms * 1.4)  # ~ sentence / paragraph
     elif end in ",:;":
         delay = int(base_ms * 0.6)
     else:
         delay = base_ms
-    delay = max(80, min(2000, delay))
+    delay = max(40, min(2000, delay))
     end_at = time.monotonic() + delay / 1000.0
     while time.monotonic() < end_at:
         if _stop_event.is_set() or is_paused():
@@ -1249,6 +1255,17 @@ def speak_text(item: SpeechItem) -> None:
                 current_path = None
 
                 if prefetch_thread is not None:
+                    # Prefetch не успел → тишина без статуса «синтез» ощущается как лаг голоса.
+                    if prefetch_thread.is_alive():
+                        set_progress(
+                            "synthesizing",
+                            engine=engine,
+                            current=index + 2,
+                            total=len(units),
+                            source=item.source,
+                            conversation_id=item.conversation_id,
+                            generation_id=item.generation_id,
+                        )
                     prefetch_thread.join(timeout=180.0)
                     prefetch_thread = None
                     if (
@@ -1274,7 +1291,11 @@ def speak_text(item: SpeechItem) -> None:
                     pause_ms = int(effective_speak_settings(live_cfg)["pause_ms"])
                 except Exception:
                     pass
-                pause_after_chunk(part, pause_ms)
+                # Следующий кусок уже в памяти — не тянуть паузу ×1.4 (дыры между фразами).
+                gap_ms = pause_ms
+                if ready_path is not None and ready_index == index:
+                    gap_ms = min(pause_ms, 160)
+                pause_after_chunk(part, gap_ms)
                 if units[index][1] != lang and switch_ms > 0:
                     end_at = time.monotonic() + switch_ms / 1000.0
                     while time.monotonic() < end_at:

@@ -1,5 +1,8 @@
 # Публикация на GitHub
 
+📍 Канон пуша — эта песочница → **Cursor-TTS**.  
+Витрина-зеркало в `Portfolio/Cursor_TTS` — только по явной просьбе (см. `MAP.md` + `.cursor/rules/tts-two-repos.mdc`).
+
 Push падает с `Repository not found`, пока **пустой репозиторий не создан** на GitHub.
 
 ## 1. Создай репо (30 сек)

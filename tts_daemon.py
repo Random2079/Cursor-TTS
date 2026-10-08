@@ -50,6 +50,7 @@ _ENGINES = {"local", "edge", "tera", "qwen", "openai"}
 _DEAD_ENGINES = {"kokoro", "piper"}  # kokoro→edge, piper→local
 _HYBRID_MODES = {"off", "dict_only"}
 _MANUAL_PROFILES = frozenset({"manual", "off", ""})
+_LEGACY_PROFILES = {"a": "normal", "b": "slow", "c": "normal", "d": "fast"}
 # Живой Qwen на 3050: 20–30с / до ~160с если тесно. Дальше CUDA стоит — процесс надо убить.
 WARMUP_STALE_SEC = 240
 WARMUP_BUSY_OTHER = -1
@@ -338,6 +339,7 @@ def load_config() -> dict:
                 hybrid = "dict_only"
             data["hybrid_mode"] = hybrid if hybrid in _HYBRID_MODES else DEFAULT_HYBRID_MODE
             profile = str(raw.get("reading_profile", DEFAULT_READING_PROFILE)).strip().lower()
+            profile = _LEGACY_PROFILES.get(profile, profile)
             data["reading_profile"] = profile or DEFAULT_READING_PROFILE
             data["qwen_model"] = (
                 str(raw.get("qwen_model", DEFAULT_QWEN_MODEL)).strip() or DEFAULT_QWEN_MODEL
@@ -953,12 +955,13 @@ def load_reading_profiles() -> dict:
 def effective_speak_settings(cfg: dict) -> dict:
     """
     pause_ms / tera_duration_scale / chunk_target с учётом reading_profile.
-    manual → слайдеры; rollback/A–D → пресет (откат = явная точка до подбора).
+    manual → слайдеры; fast/normal/slow/rollback → пресет.
     """
     pause_ms = int(cfg.get("pause_ms", DEFAULT_PAUSE_MS))
     scale = float(cfg.get("tera_duration_scale", DEFAULT_TERA_DURATION_SCALE))
     chunk_target: int | None = None
     name = str(cfg.get("reading_profile", DEFAULT_READING_PROFILE)).strip().lower()
+    name = _LEGACY_PROFILES.get(name, name)
     if name in _MANUAL_PROFILES:
         return {
             "pause_ms": pause_ms,

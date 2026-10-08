@@ -63,6 +63,7 @@ _ENGINES = {"local", "edge", "tera", "qwen", "openai"}
 _DEAD_ENGINES = {"kokoro", "piper"}
 _HYBRID_MODES = {"off", "dict_only"}
 _MANUAL_PROFILES = frozenset({"manual", "off", ""})
+_LEGACY_PROFILES = {"a": "normal", "b": "slow", "c": "normal", "d": "fast"}
 PROFILES_FILE = ROOT / "reading_profiles.json"
 HYBRID_ITEMS = [
     ("off", "Как написано (без словаря)"),
@@ -165,6 +166,7 @@ def load_config() -> dict:
     data["hybrid_mode"] = hybrid if hybrid in _HYBRID_MODES else DEFAULT_HYBRID_MODE
 
     profile = str(data.get("reading_profile", DEFAULT_READING_PROFILE)).strip().lower()
+    profile = _LEGACY_PROFILES.get(profile, profile)
     data["reading_profile"] = profile or DEFAULT_READING_PROFILE
 
     design = str(data.get("micro_wife_design_file", DEFAULT_QWEN_DESIGN)).strip()
@@ -536,7 +538,7 @@ def speech_in_progress(status: dict) -> bool:
 
 
 def load_reading_profile_items() -> list[tuple[str, str]]:
-    """[(code, label)] для комбо: manual + rollback/A–D из файла."""
+    """[(code, label)] для комбо: manual + fast/normal/slow/rollback из файла."""
     items = [("manual", "Ручной (слайдеры)")]
     try:
         raw = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
@@ -544,8 +546,7 @@ def load_reading_profile_items() -> list[tuple[str, str]]:
         return items
     if not isinstance(raw, dict):
         return items
-    # rollback первым после manual
-    order = ["rollback", "a", "b", "c", "d"]
+    order = ["fast", "normal", "slow", "rollback"]
     seen: set[str] = set()
     for key in order:
         for raw_key, value in raw.items():

@@ -1,33 +1,27 @@
 {
-  "_comment": "Пресеты чтения. manual = слайдеры. rollback = снимок «голос ок» 2026-10-02 (config_backups/2026-10-02_heard_ok).",
+  "_comment": "Пресеты чтения. manual = слайдеры. rollback = снимок «голос ок» 2026-10-02. Старые a/b/c/d в конфиге маппятся на fast/normal/slow в коде.",
+  "fast": {
+    "label": "Быстро",
+    "tera_duration_scale": 1.08,
+    "pause_ms": 350,
+    "chunk_target": 400
+  },
+  "normal": {
+    "label": "Нормально",
+    "tera_duration_scale": 1.12,
+    "pause_ms": 400,
+    "chunk_target": 360
+  },
+  "slow": {
+    "label": "Медленно",
+    "tera_duration_scale": 1.35,
+    "pause_ms": 700,
+    "chunk_target": 280
+  },
   "rollback": {
     "label": "Откат · голос ок 2026-10-02",
     "tera_duration_scale": 1.18,
     "pause_ms": 480,
     "chunk_target": 320
-  },
-  "A": {
-    "label": "A · спокойный (чуть быстрее)",
-    "tera_duration_scale": 1.18,
-    "pause_ms": 480,
-    "chunk_target": 320
-  },
-  "B": {
-    "label": "B · ещё спокойнее",
-    "tera_duration_scale": 1.35,
-    "pause_ms": 700,
-    "chunk_target": 280
-  },
-  "C": {
-    "label": "C · средний",
-    "tera_duration_scale": 1.2,
-    "pause_ms": 450,
-    "chunk_target": 340
-  },
-  "D": {
-    "label": "D · плотнее / меньше дыр",
-    "tera_duration_scale": 1.15,
-    "pause_ms": 280,
-    "chunk_target": 420
   }
 }

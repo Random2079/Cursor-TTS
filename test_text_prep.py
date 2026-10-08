@@ -200,7 +200,7 @@ class TestReadingProfiles(unittest.TestCase):
         self.assertEqual(eff["pause_ms"], 777)
         self.assertIsNone(eff["chunk_target"])
 
-    def test_profile_a_overrides_chunk(self) -> None:
+    def test_legacy_a_maps_to_normal(self) -> None:
         import tts_daemon as daemon
 
         cfg = {
@@ -209,10 +209,10 @@ class TestReadingProfiles(unittest.TestCase):
             "tera_duration_scale": 1.0,
         }
         eff = daemon.effective_speak_settings(cfg)
-        self.assertEqual(eff["reading_profile"], "a")
-        self.assertEqual(eff["pause_ms"], 480)
-        self.assertEqual(eff["chunk_target"], 320)
-        self.assertAlmostEqual(float(eff["tera_duration_scale"]), 1.18)
+        self.assertEqual(eff["reading_profile"], "normal")
+        self.assertEqual(eff["pause_ms"], 400)
+        self.assertEqual(eff["chunk_target"], 360)
+        self.assertAlmostEqual(float(eff["tera_duration_scale"]), 1.12)
 
     def test_rollback_exists(self) -> None:
         import tts_daemon as daemon
@@ -221,7 +221,7 @@ class TestReadingProfiles(unittest.TestCase):
             {"reading_profile": "rollback", "pause_ms": 1, "tera_duration_scale": 1.0}
         )
         self.assertEqual(eff["reading_profile"], "rollback")
-        self.assertEqual(eff["chunk_target"], 520)
+        self.assertEqual(eff["chunk_target"], 320)
 
 
 class TestRuOnlyHybrid(unittest.TestCase):

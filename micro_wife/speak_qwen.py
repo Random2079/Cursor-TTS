@@ -130,10 +130,10 @@ def _pick_dtype():
     import torch
 
     if torch.cuda.is_available():
-        # float16 на 3050 даёт device-side assert в multinomial у qwen-tts;
-        # bfloat16 стабилен, но на Laptop 3050 в замере был медленнее fp32 — оставляем fp32.
-        # float32 жрёт больше VRAM, но стабильнее на Laptop 4GB.
-        return torch.float32
+        # float16 на 3050 → device-side assert в multinomial у official qwen-tts.
+        # bfloat16 на Ampere стабилен и жрёт меньше VRAM, чем fp32 (замер 2026-10-09).
+        # faster/CUDA graphs по умолчанию выкл — см. _use_faster_backend.
+        return torch.bfloat16
     return torch.float32
 
 

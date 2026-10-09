@@ -157,6 +157,24 @@ def _enable_cuda_fast_paths() -> dict:
     }
 
 
+def _freeze_rope_inv_freq(root, device: str) -> int:
+    """Локальный патч qwen_tts (_ensure_inv_freq) делает .item() на каждом forward:
+    sync CPU↔GPU на каждом шаге декода и запрет CUDA graph capture.
+    Чиним нулевой inv_freq один раз после загрузки, дальше проверку отключаем.
+    """
+    import torch
+
+    ref = torch.zeros(1, device=device)
+    patched = 0
+    for module in root.modules():
+        if not hasattr(type(module), "_ensure_inv_freq"):
+            continue
+        module._ensure_inv_freq(ref)
+        module._ensure_inv_freq = lambda *_args, **_kwargs: None
+        patched += 1
+    return patched
+
+
 def unload() -> bool:
     """Снять модель с VRAM. False = load ещё держит lock, жди рестарт процесса."""
     global _model, _model_id, _model_backend
@@ -224,6 +242,7 @@ def warmup(
                     attn_implementation="sdpa",
                     max_seq_len=512,
                 )
+                _freeze_rope_inv_freq(_model.model.model, "cuda")
                 _model.warmup(prefill_len=100)
                 _model_backend = "faster"
                 _model_id = mid
@@ -250,6 +269,7 @@ def warmup(
             device_map=device if device.startswith("cuda") else "cpu",
             dtype=dtype,
         )
+        _freeze_rope_inv_freq(_model.model, device)
         _model_backend = "official"
         _model_id = mid
         _ = speaker  # reserved for future speaker-specific preload

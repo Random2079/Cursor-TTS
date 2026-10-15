@@ -1,6 +1,13 @@
 # Cursor TTS
 
-Локальная озвучка ответов **Cursor Agent** на Windows: хук после ответа → фоновый демон → TTS-движок. Панель PyQt, хоткеи AutoHotkey, очередь, пауза на слоге, несколько движков (Tera / Edge / Silero / Qwen).
+Локальная озвучка текста на **Windows**: панель PyQt, фоновый демон, очередь, пауза на слоге, хоткеи AutoHotkey, движки Tera / Edge / Silero / Qwen / OpenAI.
+
+Два режима:
+
+| Режим | Кому | Cursor нужен? |
+|-------|------|---------------|
+| **Обычный текст** | озвучить файл, выделение, тест из панели | **нет** |
+| **Авто Agent** | ответы Cursor Agent после хука | да |
 
 > Отдельный репозиторий для витрины. Раньше лежало внутри [Portfolio](https://github.com/Random2079/Portfolio) — здесь только TTS.
 
@@ -18,35 +25,87 @@
 
 ---
 
-## Запустится ли «из коробки» у другого человека?
+## A. Без Cursor — просто озвучка
 
-**Нет, не полностью.** Клон + `pip install` поднимают панель и ручную озвучку.  
-**Авто-озвучка ответов агента** требует ещё один шаг: Cursor **не** подхватывает TTS-хуки сам из папки проекта навсегда для всех чатов.
+Хук Cursor **не нужен**. Достаточно клона, Python и панели (или CLI).
 
-Нужно один раз:
+### 1. Зависимости
+
+```powershell
+git clone https://github.com/Random2079/Cursor-TTS.git
+cd Cursor-TTS
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+### 2. Панель
+
+`Start_TTS_Panel.vbs` / `Start_TTS_Panel.bat` — поднимает демон и прогрев.
+
+В панели выбери движок (для быстрого старта — **Edge**: онлайн, без ключа) и нажми тест / озвучь текст.
+
+### 3. Из командной строки
+
+Текст в UTF-8 файл:
+
+```powershell
+Set-Content -Encoding utf8 say.txt "Привет. Это проверка озвучки без Cursor."
+python speak_edge.py say.txt
+```
+
+Если демон не запущен — клиент поднимет его сам.
+
+| Команда | Действие |
+|---------|----------|
+| `python speak_edge.py say.txt` | озвучить файл |
+| `python speak_edge.py --stop` | стоп + очистить очередь |
+| `python speak_edge.py --pause-toggle` | пауза / продолжить |
+| `python speak_edge.py --warmup` | прогрев движка |
+
+Движок и голос задаются в `tts_config.json` или в панели (не через `--voice` в CLI).
+
+### 4. Хоткеи (опционально)
+
+Нужен [AutoHotkey](https://www.autohotkey.com/). Панель обычно поднимает `hotkey_tts.ahk`.
+
+| Комбинация | Действие |
+|------------|----------|
+| `Ctrl+Shift+S` | озвучить выделение (любое окно) |
+| `Ctrl+Shift+P` | пауза / продолжить |
+| `Ctrl+Shift+X` | стоп: речь + очередь |
+| `Ctrl+Shift+T` | авто ON/OFF (имеет смысл с хуком Cursor) |
+
+---
+
+## B. С Cursor — авто-озвучка ответов агента
+
+Сначала сделай **раздел A** (зависимости + панель). Потом один раз поставь user-hook:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install_cursor_hook.ps1
 ```
 
-Скрипт ставит **один глобальный user-hook** в `%USERPROFILE%\.cursor\` (путь к твоему клону пишет в `tts_root.txt`). После этого авто работает **во всех** workspace’ах, пока открыта панель TTS.
+Перезапусти Cursor. Держи открытой панель TTS. Авто работает во всех workspace’ах.
+
+Если перенёс папку клона — запусти install ещё раз (обновит `tts_root.txt`).
 
 | Что | Само? | Что сделать |
 |-----|-------|-------------|
 | Зависимости Python | нет | `pip install -r requirements.txt` |
-| Панель / демон | почти | `Start_TTS_Panel.vbs` |
+| Панель / демон / ручная озвучка | почти | раздел A |
 | Авто после ответа агента | **нет** | `scripts\install_cursor_hook.ps1` + перезапуск Cursor |
-| Хоткеи | нет | AutoHotkey + панель/ярлык поднимают `hotkey_tts.ahk` |
+| Хоткеи | нет | AutoHotkey + панель |
 | Модели (Tera/Silero/Qwen) | нет | скачиваются/ставятся под выбранный движок |
 
-Почему так: хуки Cursor живут в user/project JSON. Project-хуки в каждом репо легко разъезжаются и ломают парсер (`loop_limit: 0`). Поэтому в репо `hooks.json` **пустой**, канон — один user-hook на машину.
+Почему хук отдельно: Cursor не подхватывает project-hooks из клона «навсегда для всех чатов». Project-хуки в каждом репо легко ломают парсер (`loop_limit: 0`). В репо `hooks.json` **пустой**; канон — один user-hook в `%USERPROFILE%\.cursor\`.
 
 ---
 
 ## Архитектура
 
 ```
-Cursor user hook (~/.cursor/hooks/…)
+  [опционально] Cursor user hook (~/.cursor/hooks/…)
         │
         ▼
   speak_edge.py  ──►  tts_daemon.py  ──►  Tera / Edge / Silero / Qwen / OpenAI
@@ -55,15 +114,17 @@ Cursor user hook (~/.cursor/hooks/…)
    hotkey_tts.ahk
 ```
 
+Без Cursor цепочка та же, только вход — панель / CLI / хоткей, а не хук.
+
 | Компонент | Файл |
 |-----------|------|
-| Хук (шаблон в репо) | `.cursor/hooks/tts_after_response.py` |
-| Хук (живой, после install) | `%USERPROFILE%\.cursor\hooks\tts_after_response.py` |
 | Клиент | `speak_edge.py` |
 | Демон | `tts_daemon.py` |
 | Панель | `TTS_Panel.py` |
 | Текст | `text_prep.py` |
 | Хоткеи | `hotkey_tts.ahk` |
+| Хук (шаблон) | `.cursor/hooks/tts_after_response.py` |
+| Хук (живой, после install) | `%USERPROFILE%\.cursor\hooks\tts_after_response.py` |
 
 Статус и очередь: [`MAP.md`](MAP.md).  
 Контракты Stop / warmup / Авто: [`docs/TZ.md`](docs/TZ.md).
@@ -73,42 +134,10 @@ Cursor user hook (~/.cursor/hooks/…)
 | Engine | Роль | Cold start |
 |--------|------|------------|
 | **tera** | дефолт, качество | 30–90 с |
-| **edge** | онлайн, без ключа | ~1–7 с |
+| **edge** | онлайн, без ключа — удобный старт без Cursor | ~1–7 с |
 | **local** | Silero офлайн | после warmup быстро |
 | **qwen** | GPU, лучшее качество | долго |
 | **openai** | облако | ключ + VPN |
-
-## Быстрый старт
-
-### 1. Зависимости
-
-```powershell
-cd Cursor-TTS
-pip install -r requirements.txt
-```
-
-### 2. Панель
-
-`Start_TTS_Panel.vbs` / `Start_TTS_Panel.bat` — поднимает демон и прогрев.
-
-### 3. Хук Cursor (один раз на машину)
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install_cursor_hook.ps1
-```
-
-Перезапусти Cursor. Открой панель. Авто должно работать в любом проекте.
-
-Если перенёс папку клона — запусти install ещё раз (обновит `tts_root.txt`).
-
-### 4. Горячие клавиши
-
-| Комбинация | Действие |
-|------------|----------|
-| `Ctrl+Shift+T` | авто ON/OFF |
-| `Ctrl+Shift+P` | пауза / продолжить (тот же слог) |
-| `Ctrl+Shift+X` | стоп: речь + очередь |
-| `Ctrl+Shift+S` | озвучить выделение |
 
 ## Настройки
 
@@ -119,11 +148,11 @@ OpenAI: `.env` (`OPENAI_API_KEY=...`).
 
 | Что | Где |
 |-----|-----|
-| Хук | `%TEMP%\cursor_tts_hook.log` |
 | Озвучка | `tts_debug.log` |
 | Демон | `python speak_edge.py --restart-daemon --warmup` |
+| Хук Cursor | `%TEMP%\cursor_tts_hook.log` |
 
-Ищи в логе хука: `Hook invoked (user-global)` → `TTS auto queued`.  
+В логе хука: `Hook invoked (user-global)` → `TTS auto queued`.  
 Если `hook stop ignored (status=completed)` — норма, речь не рвётся.
 
 ## Тесты

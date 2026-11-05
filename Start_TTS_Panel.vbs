@@ -8,7 +8,12 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 folder = fso.GetParentFolderName(WScript.ScriptFullName)
 panel = folder & "\TTS_Panel.py"
 ahkScript = folder & "\hotkey_tts.ahk"
-pythonw = shell.ExpandEnvironmentStrings("%LocalAppData%") & "\Programs\Python\Python313\pythonw.exe"
+' Сначала .venv проекта. Если его нет — Python 3.13, в нём на этой машине есть PyQt5.
+pythonw = folder & "\.venv\Scripts\pythonw.exe"
+
+If Not fso.FileExists(pythonw) Then
+  pythonw = shell.ExpandEnvironmentStrings("%LocalAppData%") & "\Programs\Python\Python313\pythonw.exe"
+End If
 
 If Not fso.FileExists(pythonw) Then
   pythonw = "C:\Users\Home\AppData\Local\Programs\Python\Python313\pythonw.exe"

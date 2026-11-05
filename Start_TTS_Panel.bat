@@ -1,6 +1,8 @@
 @echo off
 cd /d "%~dp0"
-set "PYW=%LocalAppData%\Programs\Python\Python313\pythonw.exe"
+REM .venv рядом со скриптом, если есть. Иначе Python 3.13 — на этой машине там стоит PyQt5.
+set "PYW=%~dp0.venv\Scripts\pythonw.exe"
+if not exist "%PYW%" set "PYW=%LocalAppData%\Programs\Python\Python313\pythonw.exe"
 if not exist "%PYW%" set "PYW=C:\Users\Home\AppData\Local\Programs\Python\Python313\pythonw.exe"
 
 REM Start hotkeys with AutoHotkey v1 (modern install is under v1.1.*)

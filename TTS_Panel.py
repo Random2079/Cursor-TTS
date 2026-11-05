@@ -677,7 +677,8 @@ class TTSPanel(QMainWindow):
         self.setWindowTitle("Cursor TTS")
         self.resize(420, 380)
         self._center()
-        self._updating = False
+        # Пока комбо наполняются, currentIndexChanged не должен писать tts_config.json.
+        self._updating = True
         self._poll_busy = False
         self._preview_hold = False
         self._stale_killed = False
@@ -1350,6 +1351,46 @@ class TTSPanel(QMainWindow):
         super().closeEvent(event)
 
 
+def _win32_restore(hwnd: int) -> None:
+    """SW_RESTORE: окно, стартовавшее скрытым, иначе так и остаётся без WS_VISIBLE."""
+    if sys.platform != "win32" or hwnd <= 0:
+        return
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.ShowWindow(hwnd, 9)
+    user32.SetForegroundWindow(hwnd)
+
+
+def _focus_existing_panel() -> bool:
+    """Второй запуск только показывает уже живое окно и сразу выходит."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(hwnd, _lparam):  # noqa: ANN001
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value or ""
+        if title == "Cursor TTS" or title.startswith("Cursor TTS "):
+            found.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(_enum, 0)
+    if not found:
+        return False
+    _win32_restore(found[0])
+    return True
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Cursor TTS")
@@ -1359,21 +1400,18 @@ def main() -> int:
 
     guard = QSharedMemory("CursorTTS_Panel_SingleInstance")
     if guard.attach():
-        QMessageBox.information(
-            None,
-            "Cursor TTS",
-            "Панель уже открыта.\nНайди окно «Cursor TTS» на панели задач.",
-        )
+        _focus_existing_panel()
         return 0
     if not guard.create(1):
         guard.detach()
         if not guard.create(1):
-            QMessageBox.warning(
-                None,
-                "Cursor TTS",
-                "Не удалось запустить панель.\n"
-                "Закрой pythonw в диспетчере задач и попробуй снова.",
-            )
+            if not _focus_existing_panel():
+                QMessageBox.warning(
+                    None,
+                    "Cursor TTS",
+                    "Не удалось запустить панель.\n"
+                    "Закрой pythonw в диспетчере задач и попробуй снова.",
+                )
             return 1
     # Держим SharedMemory живым до выхода (иначе GC → «уже открыта» ломается).
     app._tts_single_instance = guard  # type: ignore[attr-defined]
@@ -1383,6 +1421,7 @@ def main() -> int:
     window.show()
     window.raise_()
     window.activateWindow()
+    _win32_restore(int(window.winId()))
     # Холодный старт Kokoro/Qwen — в фоне
     QTimer.singleShot(300, warmup_tts_backend)
     return app.exec_()

@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Cursor-TTS для ChatGPT",
+  "version": "1.0.0",
+  "description": "Озвучка ответов ChatGPT через локальный Cursor-TTS. Свои сообщения не читает.",
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "http://127.0.0.1:47392/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

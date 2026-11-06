@@ -66,6 +66,13 @@
 | 7 | Фризы на cold load / синтезе Tera (CPU ONNX) | ⏸ оставить · см. ниже |
 | 8 | Докинуть EN-голоса Tera (`eng_*`) в панель | 🚫 без просьбы |
 | 9 | `test_tts_playback.test_stop_clears_queue` (enqueue ждёт SpeechItem) | ⬜ не к пресетам |
+| 10 | ChatGPT → мост `127.0.0.1:47392` → speak/stop демона | 🧪 кнопки: загрузить `chrome/chatgpt` |
+
+### ChatGPT (мост, не второй движок)
+
+📁 `chatgpt_tts_http.py` · `Start_ChatGPT_TTS.bat` · `chrome/chatgpt/`  
+Голос не подменяется: в демон уходят только `{"cmd":"speak","text"}` и `{"cmd":"stop"}`, спикер из текущего `tts_config.json`.  
+Чужой Origin — 403. Свои сообщения, меню и кнопка расширения не читаются и не добавляются. Панель не трогать.
 
 ---
 

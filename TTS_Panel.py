@@ -364,18 +364,34 @@ def chrome_bridge_alive() -> bool:
         return False
 
 
+def _bridge_python() -> str:
+    """pythonw — без чёрного терминала. python.exe только запасной."""
+    here = Path(sys.executable)
+    for candidate in (
+        here.with_name("pythonw.exe"),
+        ROOT / ".venv" / "Scripts" / "pythonw.exe",
+        here,
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
+
+
 def start_chrome_bridge() -> str:
     """Поднятие chatgpt_tts_http.py. Батник больше не нужен."""
     if not CHATGPT_BRIDGE_SCRIPT.is_file():
         return "missing_script"
     if chrome_bridge_alive():
         return "already_running"
-    # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP — мост не жрёт консоль панели.
-    flags = 0x08000200 if sys.platform == "win32" else 0
+    # DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    flags = (
+        (0x00000008 | 0x08000000 | 0x00000200) if sys.platform == "win32" else 0
+    )
     try:
         proc = subprocess.Popen(
-            [sys.executable, str(CHATGPT_BRIDGE_SCRIPT)],
+            [_bridge_python(), str(CHATGPT_BRIDGE_SCRIPT)],
             cwd=str(ROOT),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=flags,

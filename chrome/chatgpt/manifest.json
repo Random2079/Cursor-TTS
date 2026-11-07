@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Cursor-TTS для ChatGPT",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Озвучка ответов ChatGPT через локальный Cursor-TTS. Свои сообщения не читает.",
   "host_permissions": [
     "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
     "http://127.0.0.1:47392/*"
   ],
   "background": {
@@ -12,9 +13,13 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": false
     }
   ]
 }

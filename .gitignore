@@ -38,6 +38,7 @@ Desktop.ini
 .DS_Store
 
 tts_daemon.pid
+chatgpt_tts_http.pid
 
 
 _qwen_probe*.wav

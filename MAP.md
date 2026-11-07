@@ -23,9 +23,9 @@
 
 | | |
 |---|---|
-| 📍 **Где мы** | Tera режет **по предложениям** (не абзац ~360). Панель/хук на `C:\Dev\DS\Cursor_TTS`. |
-| 🎯 **Фокус** | Ухом: первый звук после короткого предложения; ChatGPT-кнопки ещё 🧪. |
-| 📁 **Код** | `tts_daemon.py` · `reading_profiles.json` · `chrome/chatgpt/` · `chatgpt_tts_http.py` |
+| 📍 **Где мы** | Chrome ChatGPT: галка в панели поднимает мост `:47392`. Расширение — один раз руками. |
+| 🎯 **Фокус** | Смоук: галка ON → chatgpt.com → «Озвучить» под ответом. |
+| 📁 **Код** | `TTS_Panel.py` · `chatgpt_tts_http.py` · `chrome/chatgpt/` |
 
 ---
 
@@ -68,13 +68,15 @@
 | 7 | Фризы на cold load / синтезе Tera (CPU ONNX) | ⏸ оставить · см. ниже |
 | 8 | Докинуть EN-голоса Tera (`eng_*`) в панель | 🚫 без просьбы |
 | 9 | `test_tts_playback.test_stop_clears_queue` (enqueue ждёт SpeechItem) | ⬜ не к пресетам |
-| 10 | ChatGPT → мост `127.0.0.1:47392` → speak/stop демона | 🧪 кнопки: загрузить `chrome/chatgpt` |
+| 10 | ChatGPT → мост `127.0.0.1:47392` → speak/stop демона | ✅ код · 🧪 ухо |
+| 10b | Галка «Озвучка Chrome · ChatGPT» в панели (без батника) | ✅ код · 🧪 ухо |
 
 ### ChatGPT (мост, не второй движок)
 
-📁 `chatgpt_tts_http.py` · `Start_ChatGPT_TTS.bat` · `chrome/chatgpt/`  
+📁 `chatgpt_tts_http.py` · `Start_ChatGPT_TTS.bat` (запас) · `chrome/chatgpt/` · галка в `TTS_Panel.py`  
 Голос не подменяется: в демон уходят только `{"cmd":"speak","text"}` и `{"cmd":"stop"}`, спикер из текущего `tts_config.json`.  
-Чужой Origin — 403. Свои сообщения, меню и кнопка расширения не читаются и не добавляются. Панель не трогать.
+Чужой Origin — 403. Свои сообщения не читаются. Крест панели гасит и мост.  
+Один раз: `chrome://extensions` → режим разработчика → «Загрузить распакованное» → папка `chrome/chatgpt`.
 
 ---
 

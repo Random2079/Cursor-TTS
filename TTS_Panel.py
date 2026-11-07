@@ -295,6 +295,10 @@ def set_panel_active(active: bool) -> None:
 
 DAEMON_PID_FILE = ROOT / "tts_daemon.pid"
 AHK_SCRIPT = ROOT / "hotkey_tts.ahk"
+CHATGPT_BRIDGE_SCRIPT = ROOT / "chatgpt_tts_http.py"
+CHATGPT_BRIDGE_PID = ROOT / "chatgpt_tts_http.pid"
+CHATGPT_BRIDGE_URL = "http://127.0.0.1:47392/health"
+CHROME_EXT_DIR = ROOT / "chrome" / "chatgpt"
 
 
 def find_ahk_v1() -> Path | None:
@@ -345,6 +349,67 @@ def ensure_hotkeys() -> str:
         return "started:assoc"
     except OSError as exc:
         return f"fail:{exc}"
+
+
+def chrome_bridge_alive() -> bool:
+    """Мост ChatGPT на :47392 отвечает /health."""
+    try:
+        from urllib.request import urlopen
+
+        with urlopen(CHATGPT_BRIDGE_URL, timeout=0.4) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        return bool(isinstance(data, dict) and data.get("ok"))
+    except Exception:
+        return False
+
+
+def start_chrome_bridge() -> str:
+    """Поднятие chatgpt_tts_http.py. Батник больше не нужен."""
+    if not CHATGPT_BRIDGE_SCRIPT.is_file():
+        return "missing_script"
+    if chrome_bridge_alive():
+        return "already_running"
+    # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP — мост не жрёт консоль панели.
+    flags = 0x08000200 if sys.platform == "win32" else 0
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(CHATGPT_BRIDGE_SCRIPT)],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+        CHATGPT_BRIDGE_PID.write_text(str(proc.pid), encoding="ascii")
+    except OSError as exc:
+        return f"fail:{exc}"
+    for _ in range(30):
+        time.sleep(0.1)
+        if chrome_bridge_alive():
+            return "started"
+        if proc.poll() is not None:
+            return f"fail:exit_{proc.returncode}"
+    return "started_slow"
+
+
+def stop_chrome_bridge() -> None:
+    """Гасим только мост ChatGPT, демон TTS не трогаем."""
+    if CHATGPT_BRIDGE_PID.is_file():
+        try:
+            pid = int(CHATGPT_BRIDGE_PID.read_text(encoding="ascii").strip())
+            _taskkill_pid(pid)
+        except (OSError, ValueError):
+            pass
+        CHATGPT_BRIDGE_PID.unlink(missing_ok=True)
+    root_norm = str(ROOT).replace("/", "\\").lower()
+    for pid, cmd in _iter_windows_cmdlines():
+        low = cmd.replace("/", "\\").lower()
+        if "chatgpt_tts_http.py" not in low:
+            continue
+        if root_norm not in low and "cursor_tts" not in low:
+            continue
+        _taskkill_pid(pid)
 
 
 def stop_speech() -> None:
@@ -443,6 +508,7 @@ def shutdown_tts_stack() -> None:
         "speak_edge.py",
         "hotkey_tts.ahk",
         "tts_panel.py",
+        "chatgpt_tts_http.py",
     )
     my_pid = os.getpid()
     for pid, cmd in _iter_windows_cmdlines():
@@ -457,6 +523,7 @@ def shutdown_tts_stack() -> None:
             continue
         _taskkill_pid(pid)
 
+    CHATGPT_BRIDGE_PID.unlink(missing_ok=True)
     PAUSE_FLAG.unlink(missing_ok=True)
 
 
@@ -696,6 +763,14 @@ class TTSPanel(QMainWindow):
         self.auto_checkbox.toggled.connect(self._on_auto_toggled)
         layout.addWidget(self.auto_checkbox)
 
+        self.chrome_checkbox = QCheckBox("Озвучка Chrome · ChatGPT", self)
+        self.chrome_checkbox.setToolTip(
+            "Мост 127.0.0.1:47392. Один раз загрузи расширение chrome/chatgpt "
+            "через chrome://extensions → «Загрузить распакованное»."
+        )
+        self.chrome_checkbox.toggled.connect(self._on_chrome_toggled)
+        layout.addWidget(self.chrome_checkbox)
+
         self.interrupt_checkbox = QCheckBox(
             "Обрывать старую озвучку новым ответом "
             "(выкл = очередь, быстрее; вкл = Stop mid-synth, возможен cold load)",
@@ -928,6 +1003,11 @@ class TTSPanel(QMainWindow):
 
     def _refresh_status(self) -> None:
         auto = "ON" if is_auto_on() else "OFF"
+        chrome = "ON" if chrome_bridge_alive() else "OFF"
+        if self.chrome_checkbox.isChecked() != (chrome == "ON"):
+            self._updating = True
+            self.chrome_checkbox.setChecked(chrome == "ON")
+            self._updating = False
         engine = self.engine_combo.currentText()
         voice_label = self.voice_combo.currentText()
         volume = self.volume_slider.value()
@@ -945,7 +1025,7 @@ class TTSPanel(QMainWindow):
         busy = daemon_busy(status)
         work = "занят" if busy else "готов"
         self.status_label.setText(
-            f"Авто: {auto} · {engine} · {voice_label} · "
+            f"Авто: {auto} · Chrome: {chrome} · {engine} · {voice_label} · "
             f"{volume}% · демон {work} · {pause_txt}"
         )
         self.progress_label.setText(format_daemon_progress(status))
@@ -1124,6 +1204,31 @@ class TTSPanel(QMainWindow):
             self.status_label.setText(
                 "Авто выкл. Демон и прогрев модели продолжают жить — "
                 "Прослушать / выделение работают."
+            )
+        self._refresh_status()
+
+    def _on_chrome_toggled(self, checked: bool) -> None:
+        if self._updating:
+            return
+        if checked:
+            result = start_chrome_bridge()
+            if result.startswith("fail") or result == "missing_script":
+                self._updating = True
+                self.chrome_checkbox.setChecked(False)
+                self._updating = False
+                self.status_label.setText(
+                    f"Chrome-мост не стартовал ({result}). "
+                    f"Нужен файл {CHATGPT_BRIDGE_SCRIPT.name}."
+                )
+                return
+            self.status_label.setText(
+                "Chrome ON · мост :47392. Один раз: chrome://extensions → "
+                f"«Загрузить распакованное» → {CHROME_EXT_DIR}"
+            )
+        else:
+            stop_chrome_bridge()
+            self.status_label.setText(
+                "Chrome OFF · мост остановлен. Демон и Авто Cursor живы."
             )
         self._refresh_status()
 

@@ -44,7 +44,8 @@ End If
 
 shell.CurrentDirectory = folder
 cmd = """" & pythonw & """ """ & panel & """"
-shell.Run cmd, 0, False
+' 1 = обычное окно. 0 (SW_HIDE) прячет панель, и в панели задач остаётся python.exe.
+shell.Run cmd, 1, False
 
 Function FindAhkV1()
   Dim candidates(6), i

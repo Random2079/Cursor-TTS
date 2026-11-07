@@ -199,8 +199,12 @@ def enqueue_auto(text: str, data: dict) -> None:
 
 
 def main() -> int:
-    log("Hook invoked (user-global)")
-    from speak_edge import daemon_alive, panel_active
+    log(f"Hook invoked (user-global) root={TTS_ROOT}")
+    try:
+        from speak_edge import daemon_alive, panel_active
+    except Exception as error:
+        log(f"import speak_edge failed: {type(error).__name__}: {error}")
+        return 0
 
     if hasattr(sys.stdin, "reconfigure"):
         try:

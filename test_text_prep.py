@@ -211,7 +211,7 @@ class TestReadingProfiles(unittest.TestCase):
         eff = daemon.effective_speak_settings(cfg)
         self.assertEqual(eff["reading_profile"], "normal")
         self.assertEqual(eff["pause_ms"], 400)
-        self.assertEqual(eff["chunk_target"], 360)
+        self.assertEqual(eff["chunk_target"], 160)
         self.assertAlmostEqual(float(eff["tera_duration_scale"]), 1.12)
 
     def test_rollback_exists(self) -> None:
@@ -221,7 +221,29 @@ class TestReadingProfiles(unittest.TestCase):
             {"reading_profile": "rollback", "pause_ms": 1, "tera_duration_scale": 1.0}
         )
         self.assertEqual(eff["reading_profile"], "rollback")
-        self.assertEqual(eff["chunk_target"], 320)
+        self.assertEqual(eff["chunk_target"], 160)
+
+    def test_tera_splits_by_sentence_not_paragraph(self) -> None:
+        import tts_daemon as daemon
+
+        text = (
+            "Первое предложение короткое. "
+            "Второе тоже короткое. "
+            "Третье заканчивает абзац."
+        )
+        parts = daemon._parts_for_engine(text, "tera", chunk_target=160)
+        self.assertEqual(len(parts), 3)
+        self.assertTrue(parts[0].startswith("Первое"))
+        self.assertTrue(parts[1].startswith("Второе"))
+        self.assertLessEqual(max(len(p) for p in parts), 160)
+
+    def test_split_prefer_sentences_cuts_long_one(self) -> None:
+        import tts_daemon as daemon
+
+        long = ("слово " * 80).strip() + "."
+        parts = daemon.split_prefer_sentences(long, max_chars=100)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(p) <= 100 for p in parts))
 
 
 class TestRuOnlyHybrid(unittest.TestCase):

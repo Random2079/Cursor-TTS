@@ -675,6 +675,11 @@ class TTSPanel(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Cursor TTS")
+        icon_path = ROOT / "cursor_tts.ico"
+        if icon_path.is_file():
+            from PyQt5.QtGui import QIcon
+
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(420, 380)
         self._center()
         # Пока комбо наполняются, currentIndexChanged не должен писать tts_config.json.
@@ -1391,9 +1396,30 @@ def _focus_existing_panel() -> bool:
     return True
 
 
+_APP_USER_MODEL_ID = "CursorTTS.Panel"
+
+
+def _set_windows_app_id() -> None:
+    """Свой ярлык на панели задач, а не общая кнопка python.exe / pythonw.exe."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    shell32 = ctypes.windll.shell32
+    shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [ctypes.c_wchar_p]
+    shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.HRESULT
+    shell32.SetCurrentProcessExplicitAppUserModelID(_APP_USER_MODEL_ID)
+
+
 def main() -> int:
+    _set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("Cursor TTS")
+    icon_path = ROOT / "cursor_tts.ico"
+    if icon_path.is_file():
+        from PyQt5.QtGui import QIcon
+
+        app.setWindowIcon(QIcon(str(icon_path)))
 
     from PyQt5.QtCore import QSharedMemory
     from PyQt5.QtWidgets import QMessageBox

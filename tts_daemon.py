@@ -749,6 +749,46 @@ def split_into_chunks(text: str, target: int = CHUNK_TARGET) -> list[str]:
     return chunks
 
 
+def split_prefer_sentences(text: str, max_chars: int = 180) -> list[str]:
+    """Одно предложение = один кусок. Длиннее max_chars — дорезка внутри.
+
+    Раньше target=360 склеивал абзац в один ONNX-прогон → минута тишины на CPU Tera.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    max_chars = max(80, min(900, int(max_chars)))
+
+    sentences: list[str] = []
+    start = 0
+    length = len(text)
+    while start < length:
+        cut = -1
+        for i in range(start, length):
+            if _is_chunk_boundary(text, i):
+                # Не режем слишком коротко (инициалы «А. Б.»), ждём нормальный хвост.
+                if i + 1 - start < 12 and i + 1 < length:
+                    continue
+                cut = i + 1
+                break
+        if cut < 0:
+            cut = length
+        piece = text[start:cut].strip()
+        if piece:
+            sentences.append(piece)
+        start = cut
+        while start < length and text[start].isspace():
+            start += 1
+
+    out: list[str] = []
+    for sentence in sentences:
+        if len(sentence) <= max_chars:
+            out.append(sentence)
+        else:
+            out.extend(split_into_chunks(sentence, target=max_chars))
+    return out
+
+
 def split_for_speech(text: str) -> list[str]:
     """Короткий первый кусок + остальные части по ~900 символов."""
     text = text.strip()
@@ -1029,19 +1069,18 @@ def _parts_for_engine(
     text: str, engine: str, *, chunk_target: int | None = None
 ) -> list[str]:
     table_like = _looks_like_table_speech(text)
-    if chunk_target is not None and engine == "tera" and not table_like:
-        return split_into_chunks(text, target=int(chunk_target))
+    if engine == "tera":
+        # CPU ONNX: по предложениям, иначе абзац = долгая тишина до первого звука.
+        cap = int(chunk_target) if chunk_target is not None else 180
+        if table_like:
+            return split_into_chunks(text, target=min(220, max(120, cap)))
+        return split_prefer_sentences(text, max_chars=cap)
     if engine == "local":
         # Silero режет длинные куски сам (~900); держим умеренно.
         return split_into_chunks(text, target=140 if table_like else 280)
     if engine == "edge":
         # Сеть: крупнее куски = меньше round-trip; Edge держит длинные фразы.
         return split_into_chunks(text, target=500 if table_like else 900)
-    if engine == "tera":
-        # Локальный ONNX: крупные куски; ложный table_like раньше давал дыры на списках.
-        return split_into_chunks(
-            text, target=220 if table_like else DEFAULT_TERA_CHUNK
-        )
     if engine == "qwen":
         # Короткие куски на Qwen дают хуже RTF (фиксированный overhead generate).
         # table_like раньше резал до 120 — это усугубляло; держим крупные куски.
